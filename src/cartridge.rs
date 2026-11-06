@@ -1,5 +1,5 @@
-//! iNES 1.0 / NES 2.0 ROM loader, .zip archive extractor, header parser,
-//! and battery-backed SRAM persistence.
+//! iNES 1.0 / NES 2.0 ROM loader, .zip archive extractor, header parser (with a
+//! CRC-keyed fixup table for known-bad headers), and battery-backed SRAM persistence.
 
 use std::fs;
 use std::io::Read;
@@ -15,21 +15,86 @@ pub enum Mirroring {
     Horizontal,
     /// Cartridge supplies 2 KB extra VRAM: four independent nametables.
     FourScreen,
-    /// Per-nametable CIRAM page selection (TxSROM / mapper 118).
-    Custom([u8; 4]),
 }
 
 #[derive(Clone, Debug)]
 pub struct Cartridge {
     pub title: String,
     pub rom_path: Option<PathBuf>,
-    pub mapper_id: u8,
+    pub mapper_id: u16,
+    pub submapper: u8,
     pub prg_rom: Vec<u8>,
-    pub chr_mem: Vec<u8>,
-    pub chr_is_ram: bool,
+    /// CHR-ROM contents (empty when the board only has CHR-RAM).
+    pub chr_rom: Vec<u8>,
+    pub chr_ram_size: usize,
+    /// Work RAM + battery-backed save RAM, presented as one contiguous block.
     pub prg_ram: Vec<u8>,
+    pub save_ram_size: usize,
     pub initial_mirroring: Mirroring,
     pub has_battery: bool,
+    /// CRC32 of PRG+CHR (the usual cartridge database key).
+    pub crc32: u32,
+    /// Board uses the MMC3 revision A IRQ behaviour.
+    pub mmc3_rev_a: bool,
+    pub is_nes2: bool,
+}
+
+pub struct HeaderFixup {
+    pub crc: u32,
+    pub mapper: Option<u16>,
+    pub submapper: Option<u8>,
+    pub battery: Option<bool>,
+    pub mirroring: Option<Mirroring>,
+    pub mmc3a: bool,
+    pub save_ram_kb: Option<usize>,
+    pub chr_ram_kb: Option<usize>,
+}
+
+include!("cartridge_fixups.rs");
+
+/// Board info for a known headerless dump.
+pub struct HeaderlessRom {
+    pub crc: u32,
+    pub mapper: u16,
+    pub submapper: u8,
+    pub prg_kb: usize,
+    pub chr_kb: usize,
+    pub chr_ram_kb: usize,
+    pub prg_ram_kb: usize,
+    pub battery: bool,
+    pub mirroring: Mirroring,
+}
+
+include!("cartridge_headerless.rs");
+
+/// Builds an NES 2.0 image for a recognised headerless dump.
+fn synthesize_header(raw: &[u8]) -> Option<Vec<u8>> {
+    let mut crc = flate2::Crc::new();
+    crc.update(raw);
+    let info = HEADERLESS_ROMS.iter().find(|r| r.crc == crc.sum())?;
+    let size_code = |kb: usize| -> u8 {
+        if kb == 0 { 0 } else { ((kb * 1024).trailing_zeros() - 6) as u8 }
+    };
+    let mut h = vec![0u8; 16];
+    h[0..4].copy_from_slice(b"NES\x1A");
+    h[4] = (info.prg_kb / 16) as u8;
+    h[5] = (info.chr_kb / 8) as u8;
+    let mut f6 = ((info.mapper & 0x0F) << 4) as u8;
+    match info.mirroring {
+        Mirroring::Vertical => f6 |= 1,
+        Mirroring::FourScreen => f6 |= 8,
+        _ => {}
+    }
+    if info.battery {
+        f6 |= 2;
+    }
+    h[6] = f6;
+    h[7] = (info.mapper & 0xF0) as u8 | 0x08;
+    h[8] = ((info.mapper >> 8) as u8 & 0x0F) | (info.submapper << 4);
+    h[10] = if info.battery { size_code(info.prg_ram_kb.max(8)) << 4 } else { size_code(info.prg_ram_kb.max(8)) };
+    h[11] = size_code(info.chr_ram_kb);
+    h.extend_from_slice(raw);
+    Some(h)
 }
 
 impl Cartridge {
@@ -40,7 +105,13 @@ impl Cartridge {
             .map_err(|e| format!("Failed to read '{}': {}", path_ref.display(), e))?;
 
         let (nes_bytes, title) = if bytes.starts_with(b"PK\x03\x04") {
-            let (extracted, inner_name) = extract_nes_from_zip(&bytes)?;
+            let (extracted, inner_name) = match extract_nes_from_zip(&bytes, true) {
+                Ok(r) => r,
+                Err(e) => {
+                    let (raw, name) = extract_nes_from_zip(&bytes, false)?;
+                    (synthesize_header(&raw).ok_or(e)?, name)
+                }
+            };
             let stem = Path::new(&inner_name)
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
@@ -54,6 +125,11 @@ impl Cartridge {
             (bytes, stem)
         };
 
+        let nes_bytes = if nes_bytes.starts_with(b"NES\x1A") {
+            nes_bytes
+        } else {
+            synthesize_header(&nes_bytes).ok_or_else(|| "Unrecognised headerless ROM (no iNES header)".to_string())?
+        };
         let mut cart = Self::from_ines_bytes(&nes_bytes, title)?;
         cart.rom_path = Some(path_ref.to_path_buf());
         cart.load_battery_sram();
@@ -66,40 +142,54 @@ impl Cartridge {
             return Err("Invalid iNES header (missing 'NES\\x1A' magic)".to_string());
         }
 
-        let prg_banks_16k = bytes[4] as usize;
-        let chr_banks_8k = bytes[5] as usize;
         let flags6 = bytes[6];
         let mut flags7 = bytes[7];
+        let is_nes2 = (flags7 & 0x0C) == 0x08;
         // Old dumping tools ("DiskDude!" etc.) left junk in bytes 7-15. For non-NES-2.0
         // headers with garbage in the padding bytes, ignore the high mapper nibble.
-        let is_nes2 = (flags7 & 0x0C) == 0x08;
-        if !is_nes2 && (bytes[7..16].windows(8).any(|w| w == b"DiskDude") || bytes[12..16].iter().any(|&b| b != 0)) {
+        if !is_nes2 && bytes[12..16].iter().any(|&b| b != 0) {
             flags7 = 0;
         }
 
+        let mut mapper_id = ((flags7 & 0xF0) | (flags6 >> 4)) as u16;
+        let mut submapper = 0u8;
+        let mut prg_size = bytes[4] as usize * 16384;
+        let mut chr_size = bytes[5] as usize * 8192;
+        let mut work_ram = 8192usize;
+        let mut save_ram = 0usize;
+        let mut chr_ram = if chr_size == 0 { 8192 } else { 0 };
+        let mut has_battery = (flags6 & 0x02) != 0;
+
+        if is_nes2 {
+            mapper_id |= ((bytes[8] & 0x0F) as u16) << 8;
+            submapper = bytes[8] >> 4;
+            let prg_msb = (bytes[9] & 0x0F) as usize;
+            let chr_msb = (bytes[9] >> 4) as usize;
+            if prg_msb != 0x0F {
+                prg_size = ((prg_msb << 8) | bytes[4] as usize) * 16384;
+            }
+            if chr_msb != 0x0F {
+                chr_size = ((chr_msb << 8) | bytes[5] as usize) * 8192;
+            }
+            let shift = |v: u8| if v == 0 { 0 } else { 64usize << v };
+            work_ram = shift(bytes[10] & 0x0F);
+            save_ram = shift(bytes[10] >> 4);
+            chr_ram = shift(bytes[11] & 0x0F) + shift(bytes[11] >> 4);
+        }
+
         let has_trainer = (flags6 & 0x04) != 0;
-        let has_battery = (flags6 & 0x02) != 0;
-        let initial_mirroring = if (flags6 & 0x01) != 0 {
+        let mut initial_mirroring = if (flags6 & 0x08) != 0 {
+            Mirroring::FourScreen
+        } else if (flags6 & 0x01) != 0 {
             Mirroring::Vertical
         } else {
             Mirroring::Horizontal
-        };
-
-        let mapper_id = (flags7 & 0xF0) | (flags6 >> 4);
-        // Four-screen VRAM is only honoured for MMC3 boards (Gauntlet, Rad Racer II);
-        // other mappers with bit 3 set are almost always bad headers.
-        let initial_mirroring = if (flags6 & 0x08) != 0 && mapper_id == 4 {
-            Mirroring::FourScreen
-        } else {
-            initial_mirroring
         };
 
         let mut offset = 16usize;
         if has_trainer {
             offset += 512;
         }
-
-        let prg_size = prg_banks_16k * 16384;
         if prg_size == 0 || bytes.len() < offset + prg_size {
             return Err(format!(
                 "Truncated PRG-ROM in '{}' (expected {} bytes at offset {}, file len {})",
@@ -109,32 +199,85 @@ impl Cartridge {
                 bytes.len()
             ));
         }
+        let data_start = offset;
         let prg_rom = bytes[offset..offset + prg_size].to_vec();
         offset += prg_size;
+        let chr_avail = bytes.len().saturating_sub(offset).min(chr_size);
+        if chr_avail < chr_size {
+            return Err(format!("Truncated CHR-ROM in '{}' (expected {} bytes)", title, chr_size));
+        }
+        let chr_rom = bytes[offset..offset + chr_size].to_vec();
 
-        let (chr_mem, chr_is_ram) = if chr_banks_8k == 0 {
-            (vec![0u8; 8192], true)
-        } else {
-            let chr_size = chr_banks_8k * 8192;
-            if bytes.len() < offset + chr_size {
-                return Err(format!(
-                    "Truncated CHR-ROM in '{}' (expected {} bytes)",
-                    title, chr_size
-                ));
+        let mut crc = flate2::Crc::new();
+        crc.update(&bytes[data_start..offset + chr_size]);
+        let crc32 = crc.sum();
+
+        let mut mmc3_rev_a = false;
+        if let Some(fix) = HEADER_FIXUPS.iter().find(|f| f.crc == crc32) {
+            if let Some(m) = fix.mapper {
+                mapper_id = m;
             }
-            (bytes[offset..offset + chr_size].to_vec(), false)
-        };
+            if let Some(s) = fix.submapper {
+                submapper = s;
+            }
+            if let Some(b) = fix.battery {
+                has_battery = b;
+            }
+            if let Some(m) = fix.mirroring {
+                initial_mirroring = m;
+            }
+            if let Some(kb) = fix.save_ram_kb {
+                save_ram = kb * 1024;
+                work_ram = 0;
+            }
+            if let Some(kb) = fix.chr_ram_kb {
+                chr_ram = kb * 1024;
+            }
+            mmc3_rev_a = fix.mmc3a;
+        }
+
+        // Four-screen is only meaningful for boards that actually carry the extra VRAM.
+        if initial_mirroring == Mirroring::FourScreen && !matches!(mapper_id, 4 | 118 | 119 | 206) {
+            initial_mirroring = if (flags6 & 0x01) != 0 { Mirroring::Vertical } else { Mirroring::Horizontal };
+        }
+
+        if !is_nes2 {
+            if has_battery && save_ram == 0 {
+                save_ram = work_ram.max(8192);
+                work_ram = 0;
+            }
+            // MMC5 boards: give enough RAM for every licensed configuration.
+            if mapper_id == 5 && save_ram + work_ram < 0x10000 {
+                if has_battery {
+                    save_ram = save_ram.max(0x8000);
+                } else {
+                    work_ram = 0x10000;
+                }
+            }
+            // MMC6 has 1 KB of internal battery-backed RAM.
+            if mapper_id == 4 && submapper == 1 {
+                save_ram = 1024;
+                work_ram = 0;
+            }
+        }
+        let save_ram_size = save_ram;
+        let total_ram = (work_ram + save_ram).max(if mapper_id == 5 { 0 } else { 8192 });
 
         Ok(Self {
             title,
             rom_path: None,
             mapper_id,
+            submapper,
             prg_rom,
-            chr_mem,
-            chr_is_ram,
-            prg_ram: vec![0u8; 8192],
+            chr_rom,
+            chr_ram_size: chr_ram,
+            prg_ram: vec![0u8; total_ram.max(1024)],
+            save_ram_size,
             initial_mirroring,
             has_battery,
+            crc32,
+            mmc3_rev_a,
+            is_nes2,
         })
     }
 
@@ -147,10 +290,11 @@ impl Cartridge {
             return;
         }
         if let Some(sav) = self.sav_path()
-            && let Ok(data) = fs::read(&sav) {
-                let len = data.len().min(self.prg_ram.len());
-                self.prg_ram[..len].copy_from_slice(&data[..len]);
-            }
+            && let Ok(data) = fs::read(&sav)
+        {
+            let len = data.len().min(self.prg_ram.len());
+            self.prg_ram[..len].copy_from_slice(&data[..len]);
+        }
     }
 
     pub fn save_battery_sram(&self, prg_ram: &[u8]) {
@@ -158,7 +302,8 @@ impl Cartridge {
             return;
         }
         if let Some(sav) = self.sav_path() {
-            let _ = fs::write(sav, prg_ram);
+            let len = if self.save_ram_size > 0 { self.save_ram_size.min(prg_ram.len()) } else { prg_ram.len() };
+            let _ = fs::write(sav, &prg_ram[..len]);
         }
     }
 }
@@ -174,7 +319,7 @@ fn read_u32_le(b: &[u8], off: usize) -> u32 {
 }
 
 /// Extracts the first `.nes` file (or valid `NES\x1A` stream) from a `.zip` byte buffer.
-pub fn extract_nes_from_zip(zip_bytes: &[u8]) -> Result<(Vec<u8>, String), String> {
+pub fn extract_nes_from_zip(zip_bytes: &[u8], require_header: bool) -> Result<(Vec<u8>, String), String> {
     if zip_bytes.len() < 22 {
         return Err("ZIP archive too small".to_string());
     }
@@ -226,7 +371,7 @@ pub fn extract_nes_from_zip(zip_bytes: &[u8]) -> Result<(Vec<u8>, String), Strin
                 if data_end <= zip_bytes.len() {
                     let comp_slice = &zip_bytes[data_start..data_end];
                     let out = decompress_zip_entry(method, comp_slice, uncomp_size)?;
-                    if out.starts_with(b"NES\x1A") {
+                    if !require_header || out.starts_with(b"NES\x1A") {
                         return Ok((out, name));
                     }
                 }
@@ -251,7 +396,7 @@ pub fn extract_nes_from_zip(zip_bytes: &[u8]) -> Result<(Vec<u8>, String), Strin
                 &zip_bytes[data_start..data_start + comp_size],
                 uncomp_size,
             )?;
-            if out.starts_with(b"NES\x1A") {
+            if !require_header || out.starts_with(b"NES\x1A") {
                 return Ok((out, name));
             }
         }

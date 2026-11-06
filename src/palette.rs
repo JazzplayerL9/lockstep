@@ -66,3 +66,24 @@ pub static NES_PALETTE: [[u8; 3]; 64] = [
     [0, 0, 0],
     [0, 0, 0],
 ];
+
+/// Applies the $2001 colour-emphasis bits (bit 0 = red, 1 = green, 2 = blue): the
+/// non-emphasised channels are attenuated, as the 2C02's NTSC output does.
+#[inline]
+pub fn apply_emphasis(rgb: [u8; 3], emphasis: u8) -> [u8; 3] {
+    if emphasis == 0 {
+        return rgb;
+    }
+    let mut out = rgb;
+    for (i, c) in out.iter_mut().enumerate() {
+        if emphasis & (1 << i) == 0 {
+            *c = ((*c as u16 * 3) / 4) as u8;
+        }
+    }
+    if emphasis == 7 {
+        for c in out.iter_mut() {
+            *c = ((*c as u16 * 3) / 4) as u8;
+        }
+    }
+    out
+}

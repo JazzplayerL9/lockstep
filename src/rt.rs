@@ -21,7 +21,7 @@ const INDEX_MASK: u8 = 0x03;
 
 /// Commands sent from the UI thread to the emulation worker thread.
 pub enum EmulatorCommand {
-    LoadRom(Cartridge),
+    LoadRom(Box<Cartridge>),
     UnloadRom,
     Reset,
     SaveState,
@@ -293,7 +293,7 @@ impl RtSharedState {
             rom_loaded: AtomicBool::new(false),
             rt_mode_enabled: AtomicBool::new(default_rt),
             sched_fifo_prio: AtomicI32::new(0),
-            overclock_enabled: AtomicBool::new(true),
+            overclock_enabled: AtomicBool::new(false),
             frames_executed: AtomicU64::new(0),
             last_jitter_ns: AtomicI64::new(0),
             max_abs_jitter_ns: AtomicU64::new(0),
@@ -321,8 +321,11 @@ pub fn spawn_emulator_worker(
 ) -> (Sender<EmulatorCommand>, JoinHandle<()>) {
     let (cmd_tx, cmd_rx): (Sender<EmulatorCommand>, Receiver<EmulatorCommand>) = channel();
 
+    // The emulator state is heap-allocated, but give the worker a generous stack anyway:
+    // the previous 2 MiB default overflowed in debug builds (the original segfault).
     let handle = thread::Builder::new()
         .name("nes-rt-worker".to_string())
+        .stack_size(16 * 1024 * 1024)
         .spawn(move || {
             // Spawn audio helper thread BEFORE elevating this worker thread to SCHED_FIFO
             let audio_stream = AudioStream::new();
@@ -341,8 +344,8 @@ pub fn spawn_emulator_worker(
                 prio
             );
 
-            let mut active_system: Option<System> = None;
-            let mut saved_snapshot: Option<System> = None;
+            let mut active_system: Option<Box<System>> = None;
+            let mut saved_snapshot: Option<Box<System>> = None;
             let mut overclock = shared.overclock_enabled.load(Ordering::Acquire);
 
             let mut next_deadline_ns = MonotonicTimer::now_ns() + NTSC_FRAME_NS;
@@ -354,11 +357,20 @@ pub fn spawn_emulator_worker(
                             if let Some(prev) = &active_system {
                                 prev.save_sram();
                             }
-                            let mut sys = System::from_cartridge(cart);
-                            sys.overclock_enabled = overclock;
+                            match System::new(*cart) {
+                                Ok(sys) => {
+                                    let mut sys = Box::new(sys);
+                                    sys.set_overclock(overclock);
+                                    active_system = Some(sys);
+                                    shared.rom_loaded.store(true, Ordering::Release);
+                                }
+                                Err(e) => {
+                                    eprintln!("[nes-rt-emu] {}", e);
+                                    active_system = None;
+                                    shared.rom_loaded.store(false, Ordering::Release);
+                                }
+                            }
                             saved_snapshot = None;
-                            active_system = Some(sys);
-                            shared.rom_loaded.store(true, Ordering::Release);
                             shared.max_abs_jitter_ns.store(0, Ordering::Release);
                             next_deadline_ns = MonotonicTimer::now_ns() + NTSC_FRAME_NS;
                         }
@@ -369,8 +381,8 @@ pub fn spawn_emulator_worker(
                             active_system = None;
                             saved_snapshot = None;
                             shared.rom_loaded.store(false, Ordering::Release);
-                            let blank = [0u8; FRAMEBUFFER_BYTES];
-                            shared.framebuffer.publish_frame(&blank);
+                            let blank = vec![0u8; FRAMEBUFFER_BYTES];
+                            shared.framebuffer.publish_frame((&blank[..]).try_into().unwrap());
                         }
                         EmulatorCommand::Reset => {
                             if let Some(sys) = &mut active_system {
@@ -385,7 +397,7 @@ pub fn spawn_emulator_worker(
                         EmulatorCommand::LoadState => {
                             if let Some(snap) = &saved_snapshot {
                                 let mut restored = snap.clone();
-                                restored.overclock_enabled = overclock;
+                                restored.set_overclock(overclock);
                                 active_system = Some(restored);
                             }
                         }
@@ -393,7 +405,7 @@ pub fn spawn_emulator_worker(
                             overclock = enabled;
                             shared.overclock_enabled.store(enabled, Ordering::Release);
                             if let Some(sys) = &mut active_system {
-                                sys.overclock_enabled = enabled;
+                                sys.set_overclock(enabled);
                             }
                         }
                         EmulatorCommand::SetRtMode(enable) => {
@@ -419,6 +431,10 @@ pub fn spawn_emulator_worker(
 
                     let fb_array: &[u8; FRAMEBUFFER_BYTES] =
                         (&sys.ppu.framebuffer[..]).try_into().unwrap();
+                    // Persist battery RAM every ~10 s so a crash doesn't lose saves.
+                    if shared.frames_executed.load(Ordering::Relaxed) % 600 == 599 {
+                        sys.save_sram();
+                    }
                     shared.framebuffer.publish_frame(fb_array);
                     audio_stream.push_samples(&mut sys.apu.audio_samples);
                     shared.frames_executed.fetch_add(1, Ordering::Relaxed);

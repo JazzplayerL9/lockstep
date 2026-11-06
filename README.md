@@ -53,7 +53,8 @@ lockstep "Super Mario Bros. 3 (USA).zip"
 - **Run-ahead** (0/1/2 frames) hides a game's own built-in input lag. It is verified frame-exact by a test.
 - **Late input sampling**: controller state is read at the instant the game strobes the pad.
 - **Low-latency audio** via ALSA/PipeWire with a lock-free ring buffer and a PI-controlled
-  dynamic rate control loop (≈10–25 ms buffered, no drift, no clicks).
+  dynamic rate control loop whose buffer target adapts to your sound server
+  (10 ms on low-quantum setups, ~20–25 ms on default PipeWire); no drift, no clicks.
 - **SCHED_FIFO** emulation and audio threads, `mlockall(MCL_ONFAULT)`, CPU pinning
   (honours `isolcpus=`), 1 ns timer slack, and a µs-precision spin-assisted deadline sleep.
   PREEMPT_RT kernels are detected.

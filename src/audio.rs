@@ -36,6 +36,11 @@ const TARGET_RELAX_PUSHES: u32 = 1800;
 const DRC_SETTLE_PUSHES: u32 = 60;
 /// Maximum rate adjustment applied by DRC (covers display-sync speed offsets up to ~1.2%).
 const MAX_RATE_DELTA: f64 = 0.015;
+/// Maximum contribution of the proportional term. The integral term carries the steady
+/// clock offset; limiting P keeps start-up transients from overshooting into underruns.
+const MAX_P_DELTA: f64 = 0.005;
+/// Weight of each new low-water sample in the smoothed fill level (per video frame).
+const DRC_SMOOTHING: f64 = 0.15;
 /// Proportional / integral gains of the buffer-level controller (per video frame).
 const DRC_KP: f64 = 0.004;
 /// Integral gain of the buffer-level controller (per video frame); see `DRC_KP`.
@@ -231,7 +236,7 @@ pub struct AudioOut {
     pub sample_rate: f64,
     /// Live statistics, shareable with the UI.
     pub stats: Arc<AudioStats>,
-    /// Exponentially smoothed low-water fill level in samples (weight 0.05 per push): the
+    /// Exponentially smoothed low-water fill level in samples (weight `DRC_SMOOTHING` per push): the
     /// measured value fed to the DRC controller.
     smoothed_fill: f64,
     /// Integral term of the DRC PI controller: accumulated error times `DRC_KI`, clamped to
@@ -368,15 +373,14 @@ impl AudioOut {
         let target = self.sample_rate * self.target_ms / 1000.0;
         let low_water = self.ring.len() as f64;
         if !self.started {
-            // Pre-fill once so playback starts at steady state, with 5 ms of extra headroom
-            // for the start-up transient (the controller trims it within a second or two).
-            let pad = vec![0.0f32; (target + self.sample_rate * 0.005) as usize];
+            // Pre-fill to the target once so playback starts at steady state.
+            let pad = vec![0.0f32; target as usize];
             self.ring.push(&pad);
             self.started = true;
             self.smoothed_fill = target;
             self.pushes_since_start = 0;
         } else {
-            self.smoothed_fill += (low_water - self.smoothed_fill) * 0.05;
+            self.smoothed_fill += (low_water - self.smoothed_fill) * DRC_SMOOTHING;
         }
         let pushed = self.ring.push(samples);
         if pushed < samples.len() {
@@ -392,7 +396,8 @@ impl AudioOut {
         if self.pushes_since_start > DRC_SETTLE_PUSHES {
             self.integral = (self.integral + err * DRC_KI).clamp(-MAX_RATE_DELTA, MAX_RATE_DELTA);
         }
-        let ratio = 1.0 + (err * DRC_KP + self.integral).clamp(-MAX_RATE_DELTA, MAX_RATE_DELTA);
+        let p_term = (err * DRC_KP).clamp(-MAX_P_DELTA, MAX_P_DELTA);
+        let ratio = 1.0 + (p_term + self.integral).clamp(-MAX_RATE_DELTA, MAX_RATE_DELTA);
         self.stats.buffered_us.store((fill / self.sample_rate * 1e6) as u64, Ordering::Relaxed);
         self.stats.low_water_us.store((low_water / self.sample_rate * 1e6) as u64, Ordering::Relaxed);
         self.stats.drc_ppm.store(((ratio - 1.0) * 1e6) as i64 as u64, Ordering::Relaxed);

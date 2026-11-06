@@ -17,8 +17,10 @@ The project was renamed from `nes-rt-emu` to **Lockstep** and licensed under the
 - **Late input sampling**: the controller state is read when the game strobes `$4016`.
   Opposing D-pad directions are filtered.
 - **New audio backend**: direct ALSA/PipeWire output through `cpal`, a lock-free ring
-  buffer, PI dynamic rate control (±1.5 %), an underrun fade-out, and a SCHED_FIFO audio
-  thread. Replaces the `paplay` pipe.
+  buffer, PI dynamic rate control (±1.5 %) with anti-windup and a self-tuning buffer
+  target, an underrun fade-out, and a SCHED_FIFO audio thread. Replaces the `paplay`
+  pipe. The output filters now follow the NES's documented output stage (90 Hz and
+  440 Hz high-pass, 14 kHz low-pass) at the actual output rate.
 - Scheduling: default priority 45 (below kernel IRQ threads, configurable with
   `LOCKSTEP_RT_PRIO`), `mlockall(MCL_ONFAULT)`, pinning to `isolcpus=` cores, and
   PREEMPT_RT detection via `/sys/kernel/realtime`.
@@ -30,6 +32,14 @@ The project was renamed from `nes-rt-emu` to **Lockstep** and licensed under the
   only after writes, no modulo on memory accesses, cached mapper hook flags, and RGBA
   conversion through a lookup table.
 - ROM data shared via `Arc` (cheap save states and run-ahead snapshots).
+
+### Fixes
+- Frame hand-off API made sound: consumers get a closure-scoped borrow (`with_latest`),
+  so a frame can't be read while the producer recycles its buffer.
+- Audio flush no longer discards samples pushed after it, and no longer allocates in
+  the real-time callback. Zero-length audio callbacks no longer panic.
+- Unloading a ROM wakes the UI immediately. Soft reset clears all DMA state. MC-ACC
+  always uses the rev B IRQ condition.
 
 ### Project
 - Library crate `lockstep_core`, binaries `lockstep` and `lockstep-headless`.

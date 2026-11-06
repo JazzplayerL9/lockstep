@@ -180,17 +180,25 @@ milliseconds. It isn't done because it would also capture keys typed into other 
   controller** watches the buffer's *low-water mark* (its level just before each push):
 
   ```
-  err      = (10 ms − low_water) / 10 ms           (smoothed, clamped to ±1)
-  integral = clamp(integral + 0.00004·err, ±1.5 %)
-  ratio    = 1 + clamp(0.004·err + integral, ±1.5 %)
+  fill     ← fill + 0.15·(low_water − fill)                (exponential smoothing)
+  err      = clamp((target − fill) / target, ±1)
+  integral = clamp(integral + 0.00004·err, ±1.5 %)         (frozen for 1 s after start/flush)
+  ratio    = 1 + clamp(clamp(0.004·err, ±0.5 %) + integral, ±1.5 %)
   output_rate = device_rate · ratio
   ```
 
   The integral term learns the constant clock offset. With a 60.00 Hz display it settles
-  near +1500…+2500 ppm, the 60.0988/60 speed difference. The proportional term handles
-  jitter. The resulting pitch change is under 0.03 semitones and inaudible.
-- **Latency**: the buffer oscillates between ~10 ms (just before a push) and ~27 ms
-  (just after), plus the device period.
+  near +1500…+2500 ppm, the 60.0988/60 speed difference. The capped proportional term
+  handles jitter without overshooting during start-up. The resulting pitch change is under
+  0.03 semitones and inaudible.
+- **Adaptive target**: the low-water target starts at 10 ms. Some sound servers pull
+  audio in bursts much larger than the device period; PipeWire's default 1024-frame
+  quantum, for example, drains ~21 ms at a time. So every underrun raises the target by
+  2 ms (max 40 ms), and each 30 s without one lowers it by 0.5 ms (min 8 ms). On a
+  low-quantum setup it stays near 10 ms; on a 1024-quantum PipeWire it settles around
+  20–25 ms after a few early underruns.
+- **Latency**: the buffer oscillates between the target (just before a push) and the
+  target + ~17 ms (just after), plus the device period.
 - The callback thread promotes itself to SCHED_FIFO on its first callback.
 - The buffer is flushed when a ROM is loaded or unloaded and when a state is loaded.
 
@@ -215,7 +223,7 @@ run-ahead), this removes roughly 25–45 ms of average latency and all periodic 
 The ROM browser (Esc) shows live statistics. `LOCKSTEP_STATS=1` prints them every 2 s:
 
 ```
-[lockstep] 59.99 fps | SYNC display 59.982 Hz margin 3.8 ms | cost 6.27 ms | jitter max 93 us | audio low-water 9.2 ms drc +1901 ppm underruns 0 overflows 0 rt=true
+[lockstep] 59.99 fps | SYNC display 59.982 Hz margin 3.8 ms | cost 6.27 ms | jitter max 93 us | audio low-water 9.2/10 ms period 240 drc +1901 ppm underruns 0 overflows 0 rt=true
 ```
 
 | Field | Meaning |
@@ -226,7 +234,8 @@ The ROM browser (Esc) shows live statistics. `LOCKSTEP_STATS=1` prints them ever
 | `margin` | current present margin |
 | `cost` | worst-case frame production time estimate |
 | `jitter max` | worst lateness of a planned frame start in this interval |
-| `audio low-water` | buffer level just before a push (target 10 ms) |
+| `audio low-water` | buffer level just before a push / current adaptive target |
+| `period` | largest audio callback size seen, in frames |
 | `drc` | current rate correction, parts per million |
 | `underruns` / `overflows` | cumulative audio buffer faults |
 | `rt` | audio thread obtained SCHED_FIFO |
@@ -247,9 +256,10 @@ In rough order of benefit:
 5. **Reserve a core.** Add to the kernel command line, using your highest core number:
    `isolcpus=7 nohz_full=7 rcu_nocbs=7 threadirqs`. Lockstep detects the isolated CPU and
    pins its emulation thread there, where nothing else runs.
-6. **PipeWire quantum.** If underruns persist, raise the quantum
-   (`pw-metadata -n settings 0 clock.force-quantum 256`), or lower it for less latency
-   if you have none.
+6. **PipeWire quantum.** PipeWire's default quantum (often 1024 frames ≈ 21 ms) sets a
+   floor on audio latency; Lockstep's adaptive target settles just above it. For lower
+   latency, force a smaller quantum while playing:
+   `pw-metadata -n settings 0 clock.force-quantum 256`.
 7. **Run-ahead.** Use 1 for most games, 2 for games known to have 2 frames of lag, 0 to
    save CPU.
 
@@ -260,7 +270,8 @@ In rough order of benefit:
 | Browser shows `SCHED_OTHER` | no `rtprio` permission; see [Permissions](#permissions) |
 | `Free-run 60.10 Hz (display 144.0 Hz)` | display not ~60 Hz; switch the mode, or accept free run (one repeated frame per ~2.4 s at 144 Hz is unavoidable without sync) |
 | `Free-run` with no display rate | swaps aren't vsync-throttled (driver/compositor vsync off) or the window is hidden |
-| Audio underruns climbing | CPU frequency scaling or another RT process; try the `performance` governor, a larger PipeWire quantum, or less run-ahead |
+| A few underruns right after start, then none | normal: the adaptive target is learning your sound server's burst size |
+| Audio underruns keep climbing | CPU frequency scaling or another RT process; try the `performance` governor or less run-ahead. A *smaller* PipeWire quantum (`pw-metadata -n settings 0 clock.force-quantum 256`) also lowers the achievable latency |
 | Occasional single hitch, `margin` growing | compositor needs more time; the margin adapts upward automatically, or try fullscreen |
 | `audio disabled: …` at start-up | no default output device; check `pactl info` / `aplay -l` |
 | Game misbehaves only with F4 | the overclock breaks that game's timing assumptions; turn it off |

@@ -15,9 +15,25 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
-/// Target for the buffer's low point (measured just before each frame's samples are
-/// queued). Total latency swings between this and this + one video frame.
+/// Initial target for the buffer's low point (measured just before each frame's samples
+/// are queued). Total latency swings between the target and the target + one video frame.
+/// The target adapts: see [`TARGET_STEP_UP_MS`].
 const TARGET_LOW_WATER_MS: f64 = 10.0;
+/// Lower bound of the adaptive low-water target.
+const TARGET_MIN_MS: f64 = 8.0;
+/// Upper bound of the adaptive low-water target.
+const TARGET_MAX_MS: f64 = 40.0;
+/// Target increase after an underrun. Sound servers that pull audio in large bursts
+/// (e.g. PipeWire with a 1024-frame quantum) need more headroom than the device period
+/// suggests; this finds the right amount automatically.
+const TARGET_STEP_UP_MS: f64 = 2.0;
+/// Target decrease after [`TARGET_RELAX_PUSHES`] consecutive underrun-free frames.
+const TARGET_STEP_DOWN_MS: f64 = 0.5;
+/// Underrun-free frames (~30 s) before the target is lowered again.
+const TARGET_RELAX_PUSHES: u32 = 1800;
+/// Frames after start-up or a flush during which the integral term is frozen, so the
+/// start-up transient can't wind it up (anti-windup).
+const DRC_SETTLE_PUSHES: u32 = 60;
 /// Maximum rate adjustment applied by DRC (covers display-sync speed offsets up to ~1.2%).
 const MAX_RATE_DELTA: f64 = 0.015;
 /// Proportional / integral gains of the buffer-level controller (per video frame).
@@ -121,6 +137,8 @@ pub struct AudioStats {
     pub rt_promoted: AtomicBool,
     /// Largest number of frames the device has requested in one callback (its period).
     pub device_period_frames: AtomicUsize,
+    /// Current adaptive low-water target, microseconds.
+    pub target_us: AtomicU64,
     /// Pending flush: the producer's `head` position at the time of `AudioOut::flush`, or
     /// `usize::MAX` for none. The audio callback discards samples up to that point only, so
     /// audio pushed after the flush survives (only the consumer may advance `tail`).
@@ -196,6 +214,7 @@ impl Default for AudioStats {
             drc_ppm: AtomicU64::new(0),
             rt_promoted: AtomicBool::new(false),
             device_period_frames: AtomicUsize::new(0),
+            target_us: AtomicU64::new((TARGET_LOW_WATER_MS * 1000.0) as u64),
             flush_to: AtomicUsize::new(usize::MAX),
         }
     }
@@ -220,6 +239,14 @@ pub struct AudioOut {
     integral: f64,
     /// Whether the ring has been pre-filled to the target level since opening or the last flush.
     started: bool,
+    /// Current adaptive low-water target, ms.
+    target_ms: f64,
+    /// Underrun count seen at the previous push (to detect new underruns).
+    last_underruns: u64,
+    /// Consecutive pushes without an underrun.
+    clean_pushes: u32,
+    /// Pushes since start-up or the last flush (for anti-windup).
+    pushes_since_start: u32,
 }
 
 /// Promote the calling thread to SCHED_FIFO at `prio` (best effort).
@@ -242,10 +269,10 @@ impl AudioOut {
         let ring = Arc::new(Ring::new(1 << 14));
         let stats = Arc::new(AudioStats::default());
         match Self::open(ring.clone(), stats.clone(), rt_prio) {
-            Ok((stream, rate)) => Self { ring, _stream: Some(stream), sample_rate: rate, stats, smoothed_fill: 0.0, integral: 0.0, started: false },
+            Ok((stream, rate)) => Self { ring, _stream: Some(stream), sample_rate: rate, stats, smoothed_fill: 0.0, integral: 0.0, started: false, target_ms: TARGET_LOW_WATER_MS, last_underruns: 0, clean_pushes: 0, pushes_since_start: 0 },
             Err(e) => {
                 eprintln!("[lockstep] audio disabled: {e}");
-                Self { ring, _stream: None, sample_rate: crate::apu::DEFAULT_SAMPLE_RATE, stats, smoothed_fill: 0.0, integral: 0.0, started: false }
+                Self { ring, _stream: None, sample_rate: crate::apu::DEFAULT_SAMPLE_RATE, stats, smoothed_fill: 0.0, integral: 0.0, started: false, target_ms: TARGET_LOW_WATER_MS, last_underruns: 0, clean_pushes: 0, pushes_since_start: 0 }
             }
         }
     }
@@ -324,14 +351,30 @@ impl AudioOut {
             samples.clear();
             return self.sample_rate;
         }
-        let target = self.sample_rate * TARGET_LOW_WATER_MS / 1000.0;
+        // Adapt the target to how bursty the device's consumption actually is.
+        let underruns = self.stats.underruns.load(Ordering::Relaxed);
+        if underruns != self.last_underruns {
+            self.last_underruns = underruns;
+            self.target_ms = (self.target_ms + TARGET_STEP_UP_MS).min(TARGET_MAX_MS);
+            self.clean_pushes = 0;
+        } else {
+            self.clean_pushes += 1;
+            if self.clean_pushes >= TARGET_RELAX_PUSHES {
+                self.clean_pushes = 0;
+                self.target_ms = (self.target_ms - TARGET_STEP_DOWN_MS).max(TARGET_MIN_MS);
+            }
+        }
+        self.stats.target_us.store((self.target_ms * 1000.0) as u64, Ordering::Relaxed);
+        let target = self.sample_rate * self.target_ms / 1000.0;
         let low_water = self.ring.len() as f64;
         if !self.started {
-            // Pre-fill to the target level once so playback starts at steady state.
-            let pad = vec![0.0f32; target as usize];
+            // Pre-fill once so playback starts at steady state, with 5 ms of extra headroom
+            // for the start-up transient (the controller trims it within a second or two).
+            let pad = vec![0.0f32; (target + self.sample_rate * 0.005) as usize];
             self.ring.push(&pad);
             self.started = true;
             self.smoothed_fill = target;
+            self.pushes_since_start = 0;
         } else {
             self.smoothed_fill += (low_water - self.smoothed_fill) * 0.05;
         }
@@ -345,7 +388,10 @@ impl AudioOut {
         // PI controller: the integral term absorbs a constant clock/speed offset so the
         // low-water mark settles exactly on target.
         let err = ((target - self.smoothed_fill) / target).clamp(-1.0, 1.0);
-        self.integral = (self.integral + err * DRC_KI).clamp(-MAX_RATE_DELTA, MAX_RATE_DELTA);
+        self.pushes_since_start = self.pushes_since_start.saturating_add(1);
+        if self.pushes_since_start > DRC_SETTLE_PUSHES {
+            self.integral = (self.integral + err * DRC_KI).clamp(-MAX_RATE_DELTA, MAX_RATE_DELTA);
+        }
         let ratio = 1.0 + (err * DRC_KP + self.integral).clamp(-MAX_RATE_DELTA, MAX_RATE_DELTA);
         self.stats.buffered_us.store((fill / self.sample_rate * 1e6) as u64, Ordering::Relaxed);
         self.stats.low_water_us.store((low_water / self.sample_rate * 1e6) as u64, Ordering::Relaxed);

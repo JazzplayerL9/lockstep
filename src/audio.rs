@@ -119,6 +119,8 @@ pub struct AudioStats {
     pub drc_ppm: AtomicU64,
     /// Whether the audio callback thread obtained SCHED_FIFO priority.
     pub rt_promoted: AtomicBool,
+    /// Largest number of frames the device has requested in one callback (its period).
+    pub device_period_frames: AtomicUsize,
     /// Pending flush: the producer's `head` position at the time of `AudioOut::flush`, or
     /// `usize::MAX` for none. The audio callback discards samples up to that point only, so
     /// audio pushed after the flush survives (only the consumer may advance `tail`).
@@ -163,6 +165,7 @@ impl Feeder {
         if n_frames == 0 {
             return &[];
         }
+        self.stats.device_period_frames.fetch_max(n_frames, Ordering::Relaxed);
         // `scratch` is pre-allocated, so this only allocates if the device asks for an
         // unusually large period.
         self.scratch.resize(n_frames, 0.0);
@@ -192,6 +195,7 @@ impl Default for AudioStats {
             low_water_us: AtomicU64::new(0),
             drc_ppm: AtomicU64::new(0),
             rt_promoted: AtomicBool::new(false),
+            device_period_frames: AtomicUsize::new(0),
             flush_to: AtomicUsize::new(usize::MAX),
         }
     }

@@ -767,7 +767,7 @@ fn worker_main(shared: Arc<RtSharedState>, cmd_rx: Receiver<EmulatorCommand>) {
             if now - stats_last >= 2_000_000_000 {
                 let a = &audio.stats;
                 eprintln!(
-                    "[lockstep] {:.2} fps | {} display {:.3} Hz margin {:.1} ms | cost {:.2} ms | jitter max {} us | audio low-water {:.1} ms drc {:+} ppm underruns {} overflows {} rt={}",
+                    "[lockstep] {:.2} fps | {} display {:.3} Hz margin {:.1} ms | cost {:.2} ms | jitter max {} us | audio low-water {:.1} ms period {} drc {:+} ppm underruns {} overflows {} rt={}",
                     stats_frames as f64 * 1e9 / (now - stats_last) as f64,
                     if sync { "SYNC" } else { "FREE" },
                     if period > 0 { 1e9 / period as f64 } else { 0.0 },
@@ -775,6 +775,7 @@ fn worker_main(shared: Arc<RtSharedState>, cmd_rx: Receiver<EmulatorCommand>) {
                     cost_est as f64 / 1e6,
                     stats_max_jitter / 1000,
                     a.low_water_us.load(Ordering::Relaxed) as f64 / 1000.0,
+                    a.device_period_frames.load(Ordering::Relaxed),
                     a.drc_ppm.load(Ordering::Relaxed) as i64,
                     a.underruns.load(Ordering::Relaxed),
                     a.overflows.load(Ordering::Relaxed),

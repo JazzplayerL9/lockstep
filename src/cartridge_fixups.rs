@@ -1,5 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Zach Jones
+//
+// Portions derived from Mesen (https://github.com/nesdev-org/MesenCE):
+// cartridge data from the Mesen game database.
+// Mesen is Copyright (C) 2014-2026 Sour and contributors, GPL-3.0-or-later.
+// (Mesen's database is itself compiled from NesCartDB, Nestopia's database and
+// NewRisingSun's NES 2.0 header database.)
+
 // Header corrections keyed by PRG+CHR CRC32, for ROMs in the local library whose
 // iNES headers disagree with known cartridge hardware.
+/// Header corrections, matched by [`HeaderFixup::crc`].
 pub static HEADER_FIXUPS: &[HeaderFixup] = &[
     HeaderFixup { crc: 0x326AB3B6, mapper: None, submapper: None, battery: None, mirroring: None, mmc3a: true, save_ram_kb: None, chr_ram_kb: None }, // 8 Eyes (USA)
     HeaderFixup { crc: 0xC527C297, mapper: None, submapper: Some(3), battery: None, mirroring: None, mmc3a: false, save_ram_kb: None, chr_ram_kb: None }, // Alien 3 (USA)

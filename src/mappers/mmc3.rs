@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Zach Jones
+//
+// Portions derived from Mesen (https://github.com/nesdev-org/MesenCE):
+// the MMC3 IRQ counter and MMC3-variant board logic.
+// Mesen is Copyright (C) 2014-2026 Sour and contributors, GPL-3.0-or-later.
+
 //! Mapper 4: Nintendo MMC3 / MMC6 (submapper 1) / Acclaim MC-ACC (submapper 3),
 //! plus the MMC3-derived boards 47 (NES-QJ), 118 (TxSROM), 119 (TQROM) and
 //! 206 (Namco 108 / DxROM).
@@ -5,31 +12,79 @@
 use super::{CartBase, ChrKind, Mapper};
 use crate::cartridge::Mirroring;
 
+/// Nintendo MMC3 and its derivatives. Registers are decoded by A0 and A13-A14:
+/// $8000/$8001 bank select/data, $A000/$A001 mirroring/PRG-RAM protect,
+/// $C000/$C001 IRQ latch/reload, $E000/$E001 IRQ disable/enable. Eight bank registers
+/// (R0-R7) give two 2 KB + four 1 KB CHR banks and two switchable 8 KB PRG banks; the
+/// other two PRG slots hold the second-to-last and last banks.
+///
+/// The scanline IRQ counter is clocked by rising edges of PPU A12. The chip filters
+/// out edges that follow only a brief low period (e.g. the alternating BG/sprite
+/// fetches within a scanline), so normally it clocks once per scanline when BG uses
+/// $0000 and sprites $1000. MMC3 revisions differ on a counter that reloads to 0:
+/// rev B (the default here) fires the IRQ whenever the counter is 0 after a clock, rev A
+/// only when it got there by decrementing or by an explicit $C001 reload
+/// (selected per cartridge via `CartBase::mmc3_rev_a`).
 #[derive(Clone)]
 pub struct Mmc3 {
+    /// Shared PRG/CHR/nametable state; registers are applied to it by [`Mmc3::update`].
     base: CartBase,
+    /// iNES mapper number (4, 47, 118, 119 or 206) selecting board-specific wiring.
     id: u16,
+    /// MMC6 (mapper 4 submapper 1): 1 KB internal PRG-RAM at $7000-$7FFF in two
+    /// 512-byte halves with separate read/write enables, gated by $8000 bit 5.
     mmc6: bool,
+    /// Acclaim MC-ACC (mapper 4 submapper 3): IRQ counter clocked on A12 falling
+    /// edges through a divide-by-8 prescaler instead of the filtered rising edge.
     mc_acc: bool,
+    /// $8000 bank select: bits 0-2 = which R register $8001 writes, bit 6 = PRG mode
+    /// (0: R6 at $8000, second-last fixed at $C000; 1: swapped), bit 7 = CHR A12
+    /// inversion (0: 2 KB banks at $0000; 1: 2 KB banks at $1000). On MMC6 bit 5
+    /// enables the internal PRG-RAM. On Namco 108 (206) only bits 0-2 exist.
     reg8000: u8,
+    /// $A001 PRG-RAM protect. MMC3: bit 7 = enable $6000-$7FFF, bit 6 = write protect.
+    /// MMC6: bit 7/6 = read/write enable for $7200-$73FF, bit 5/4 = read/write enable
+    /// for $7000-$71FF (writes ignored while $8000 bit 5 is clear). On mapper 47 the
+    /// same enable/protect bits gate writes to the outer-bank register.
     rega001: u8,
+    /// Bank registers R0-R7 written through $8001: R0-R1 = 2 KB CHR (bit 0 ignored),
+    /// R2-R5 = 1 KB CHR, R6-R7 = 8 KB PRG. On TxSROM bit 7 of the CHR registers also
+    /// selects the CIRAM page, on TQROM bit 6 selects CHR-RAM. Power-on values map
+    /// CHR banks 0-7 in order and PRG banks 0/1.
     regs: [u8; 8],
+    /// $C000 IRQ latch: value the counter is reloaded with.
     irq_latch: u8,
+    /// Scanline down-counter, reloaded from `irq_latch` when it is 0 or a reload is pending.
     irq_counter: u8,
+    /// Set by a $C001 write (which also zeroes the counter); forces a reload on the
+    /// next counter clock.
     irq_reload: bool,
+    /// IRQ enable: set by $E001, cleared by $E000.
     irq_enabled: bool,
+    /// IRQ line state; set when the counter fires while enabled, acknowledged by $E000.
     irq_pending: bool,
     /// CPU cycle (+1) at which A12 went low; 0 while A12 is high.
+    /// A rising edge only clocks the counter if A12 stayed low for at least 3 CPU
+    /// cycles, which models the M2-based low-time filter.
     a12_low_since: u64,
     // MC-ACC falling-edge prescaler.
+    /// MC-ACC prescaler: counts A12 falling edges 1..8; the IRQ counter is clocked on
+    /// the first edge of each group of 8. Reset by $C001.
     acc_counter: u8,
+    /// Previous PPU address seen by the MC-ACC edge detector, to find A12 high-to-low
+    /// transitions.
     prev_addr: u16,
     // Mapper 47 outer bank.
+    /// Mapper 47 (NES-QJ) outer bank, bit 0 of a $6000-$7FFF write: selects which
+    /// 128 KB PRG / 128 KB CHR half the MMC3 banks address.
     block: u8,
+    /// Header requests four-screen VRAM; $A000 mirroring writes are then ignored.
     four_screen: bool,
 }
 
 impl Mmc3 {
+    /// Creates the chip in its power-on state for the board given by `base.mapper_id`
+    /// and submapper. TQROM gets at least 8 KB CHR-RAM, MMC6 at least 1 KB PRG-RAM.
     pub fn new(mut base: CartBase) -> Self {
         let id = base.mapper_id;
         if id == 119 && base.chr_ram.len() < 0x2000 {
@@ -62,6 +117,8 @@ impl Mmc3 {
         m
     }
 
+    /// Translates a raw 1 KB CHR bank number into (bank, memory) for this board:
+    /// mapper 47 adds the outer 128 KB block, TQROM sends banks $40-$7F to CHR-RAM.
     fn chr_page(&self, page: u8) -> (usize, ChrKind) {
         let mut page = page as usize;
         if self.id == 47 {
@@ -74,6 +131,9 @@ impl Mmc3 {
         (page, kind)
     }
 
+    /// Translates an 8 KB PRG bank number for this board. On mapper 47 the bank is
+    /// taken modulo 16 within the selected 128 KB block, so negative (from-the-end)
+    /// numbers refer to the end of the block; other boards pass it through unchanged.
     fn prg_page(&self, page: i32) -> i32 {
         if self.id == 47 {
             (page.rem_euclid(16)) | ((self.block as i32) << 4)
@@ -82,6 +142,8 @@ impl Mmc3 {
         }
     }
 
+    /// Recomputes PRG, CHR, TxSROM nametable and PRG-RAM mappings from the registers.
+    /// MMC6 PRG-RAM is not slot-mapped; it is handled in `cpu_read` / `cpu_write`.
     fn update(&mut self) {
         let prg_mode = if self.id == 206 { 0 } else { (self.reg8000 >> 6) & 1 };
         let chr_mode = if self.id == 206 { 0 } else { (self.reg8000 >> 7) & 1 };
@@ -133,6 +195,9 @@ impl Mmc3 {
         }
     }
 
+    /// Clocks the scanline counter once: reload from the latch if it is 0 or a reload
+    /// is pending, else decrement, then raise the IRQ (if enabled) using the rev A or
+    /// rev B zero condition described on [`Mmc3`].
     fn clock_irq_counter(&mut self) {
         let count = self.irq_counter;
         if self.irq_counter == 0 || self.irq_reload {
@@ -140,7 +205,8 @@ impl Mmc3 {
         } else {
             self.irq_counter -= 1;
         }
-        let fire = if self.base.mmc3_rev_a {
+        // MC-ACC always uses the rev B condition (as Mesen does).
+        let fire = if self.base.mmc3_rev_a && !self.mc_acc {
             (count > 0 || self.irq_reload) && self.irq_counter == 0
         } else {
             self.irq_counter == 0
@@ -151,6 +217,8 @@ impl Mmc3 {
         self.irq_reload = false;
     }
 
+    /// MMC6 `(readable, writable)` for the 512-byte half containing `addr` (chosen by
+    /// A9), from the $A001 enable bits. Both false while $8000 bit 5 is clear.
     fn mmc6_ram_access(&self, addr: u16) -> (bool, bool) {
         if self.reg8000 & 0x20 == 0 {
             return (false, false);

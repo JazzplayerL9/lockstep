@@ -1,21 +1,30 @@
-//! Headless runner for regression testing.
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Zach Jones
+
+//! `lockstep-headless`: runs the Lockstep core without a window, for testing.
 //!
-//!   nes-headless test  <rom>...                         run blargg-style test ROMs ($6000 status protocol)
-//!   nes-headless shot  <rom> <frames> <out.png> [script] screenshot after N frames
-//!   nes-headless batch <dir> <frames> <outdir> [threads] boot every ROM, screenshot + summary.tsv
+//! ```text
+//! lockstep-headless test  <rom>...                          run blargg-style test ROMs ($6000 protocol)
+//! lockstep-headless shot  <rom> <frames> <out.png> [script] run N frames, save a screenshot, print speed
+//! lockstep-headless batch <dir> <frames> <outdir> [threads] boot every ROM in parallel; PNGs + summary.tsv
+//! ```
 //!
-//! Input scripts: "start" (default: taps Start periodically, then A/Right), "none".
+//! Input scripts: `start` (default), `game`, `walk`, `hold`, `none`.
+//! `LOCKSTEP_PROFILE=1` adds a sampling profile to `shot`.
+//! See docs/TESTING.md for details.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use nes_core::cartridge::Cartridge;
-use nes_core::cpu::System;
-use nes_core::input::*;
-use nes_core::png;
+use lockstep_core::cartridge::Cartridge;
+use lockstep_core::cpu::System;
+use lockstep_core::input::*;
+use lockstep_core::png;
 
+/// Controller state for `frame` under a named input script (`game`, `walk`, `hold`,
+/// `none`, or the default `start`). See docs/TESTING.md for what each does.
 fn scripted_input(script: &str, frame: u32) -> u8 {
     match script {
         "none" => 0,
@@ -56,15 +65,95 @@ fn scripted_input(script: &str, frame: u32) -> u8 {
     }
 }
 
+// ---- Minimal SIGPROF sampling profiler (`LOCKSTEP_PROFILE=1`), symbolised with addr2line.
+/// Minimal SIGPROF sampling profiler (`LOCKSTEP_PROFILE=1`). Samples the interrupted
+/// instruction pointer every 200 µs of CPU time; `report` symbolises them with `addr2line`.
+mod prof {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    /// Maximum number of samples kept.
+    const N: usize = 1 << 16;
+    /// Sampled instruction pointers. Written only by the signal handler, read after the timer stops.
+    static mut SAMPLES: [usize; N] = [0; N];
+    /// Number of samples taken (may exceed `N`; extra samples are dropped).
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    /// SIGPROF handler: records RIP from the interrupted context. Async-signal-safe (no allocation, no locks).
+    extern "C" fn handler(_: libc::c_int, _: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+        unsafe {
+            let uc = ctx as *mut libc::ucontext_t;
+            let ip = (*uc).uc_mcontext.gregs[libc::REG_RIP as usize] as usize;
+            let i = COUNT.fetch_add(1, Ordering::Relaxed);
+            if i < N {
+                (*std::ptr::addr_of_mut!(SAMPLES))[i] = ip;
+            }
+        }
+    }
+
+    /// Installs the handler and starts a 200 µs `ITIMER_PROF` timer.
+    pub fn start() {
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = handler as *const () as usize;
+            sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+            libc::sigaction(libc::SIGPROF, &sa, std::ptr::null_mut());
+            let tv = libc::timeval { tv_sec: 0, tv_usec: 200 };
+            let it = libc::itimerval { it_interval: tv, it_value: tv };
+            libc::setitimer(libc::ITIMER_PROF, &it, std::ptr::null_mut());
+        }
+    }
+
+    /// Stops the timer, converts samples to offsets in the executable (subtracting the load
+    /// base from `/proc/self/maps`), symbolises them with `addr2line` and prints the top 40.
+    pub fn report() {
+        unsafe {
+            let it: libc::itimerval = std::mem::zeroed();
+            libc::setitimer(libc::ITIMER_PROF, &it, std::ptr::null_mut());
+        }
+        let n = COUNT.load(Ordering::Relaxed).min(N);
+        let samples: Vec<usize> = unsafe { (&(*std::ptr::addr_of!(SAMPLES)))[..n].to_vec() };
+        let exe = std::fs::read_link("/proc/self/exe").unwrap();
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        let base = maps
+            .lines()
+            .find(|l| l.ends_with(exe.to_str().unwrap()))
+            .and_then(|l| usize::from_str_radix(l.split('-').next().unwrap(), 16).ok())
+            .unwrap_or(0);
+        let addrs: Vec<String> = samples.iter().map(|a| format!("{:x}", a.wrapping_sub(base))).collect();
+        let out = std::process::Command::new("addr2line")
+            .arg("-f").arg("-C").arg("-e").arg(&exe)
+            .args(&addrs)
+            .output()
+            .expect("addr2line");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut counts = std::collections::HashMap::<String, usize>::new();
+        for pair in text.lines().collect::<Vec<_>>().chunks(2) {
+            let func = pair[0].split("::{{closure}}").next().unwrap().to_string();
+            let line = pair.get(1).map(|l| l.rsplit('/').next().unwrap_or(l)).unwrap_or("");
+            *counts.entry(format!("{func}  [{line}]")).or_default() += 1;
+        }
+        let mut v: Vec<_> = counts.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        eprintln!("--- profile: {n} samples ---");
+        for (k, c) in v.iter().take(40) {
+            eprintln!("{:5.1}%  {}", *c as f64 * 100.0 / n as f64, k);
+        }
+    }
+}
+
+/// Reads CPU memory for result inspection (RAM directly, everything else through the mapper).
 fn peek(sys: &mut System, addr: u16) -> u8 {
     if addr < 0x2000 { sys.ram[(addr & 0x7FF) as usize] } else { sys.mapper.cpu_read(addr).unwrap_or(0) }
 }
 
+/// Writes the last completed frame as a PNG.
 fn save_png(sys: &System, path: &Path) {
     let data = png::encode_rgba(256, 240, &sys.ppu.framebuffer);
     let _ = std::fs::write(path, data);
 }
 
+/// Runs a test ROM using blargg's `$6000` protocol: signature `DE B0 61` at `$6001`, status
+/// `$80` = running, `$81` = reset requested, anything else = finished with that result code
+/// (0 = pass) and the text output at `$6004`. Returns (passed, message).
 fn run_test_rom(path: &str) -> (bool, String) {
     let cart = match Cartridge::from_file(path) {
         Ok(c) => c,
@@ -118,14 +207,21 @@ fn run_test_rom(path: &str) -> (bool, String) {
     (false, format!("no $6000 result (screenshot {shot})"))
 }
 
+/// One row of `summary.tsv`.
 struct BatchResult {
+    /// ROM file name without extension.
     name: String,
+    /// `ok`, `BLANK`, `JAM@<frame> pc=<addr>`, `ERR <message>` or `PANIC`.
     status: String,
+    /// Board name.
     mapper: String,
+    /// Distinct colours in the final frame (1 = blank screen).
     colors: usize,
+    /// Wall-clock time spent on this ROM.
     ms: u128,
 }
 
+/// Boots one ROM for `frames` frames with the `game` script, saves its screenshot and classifies the outcome.
 fn batch_one(path: &Path, frames: u32, outdir: &Path) -> BatchResult {
     let name = path.file_stem().unwrap().to_string_lossy().to_string();
     let t0 = Instant::now();
@@ -181,12 +277,19 @@ fn main() {
             let out = &args[4];
             let script = args.get(5).map(String::as_str).unwrap_or("start");
             let mut sys = System::new(Cartridge::from_file(rom).unwrap()).unwrap();
+            let profile = std::env::var_os("LOCKSTEP_PROFILE").is_some();
+            if profile {
+                prof::start();
+            }
             let t0 = Instant::now();
             for f in 0..frames {
                 sys.joypad.buttons_p1 = scripted_input(script, f);
                 sys.run_frame();
             }
             let el = t0.elapsed();
+            if profile {
+                prof::report();
+            }
             save_png(&sys, Path::new(out));
             println!(
                 "{} frames in {:.2?} ({:.0} fps), mapper {}, jammed={}",
@@ -248,6 +351,6 @@ fn main() {
             std::fs::write(outdir.join("summary.tsv"), tsv).unwrap();
             println!("{} ROMs, {} flagged", results.len(), bad);
         }
-        _ => eprintln!("usage: nes-headless test <rom>... | shot <rom> <frames> <out.png> [script] | batch <dir> <frames> <outdir> [threads]"),
+        _ => eprintln!("usage: lockstep-headless test <rom>... | shot <rom> <frames> <out.png> [script] | batch <dir> <frames> <outdir> [threads]"),
     }
 }

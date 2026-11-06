@@ -1,15 +1,24 @@
-//! Smoke tests against ROMs in the local library (skipped if the files are absent).
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Zach Jones
 
-use nes_core::cartridge::Cartridge;
-use nes_core::cpu::System;
-use nes_core::input::{BTN_A, BTN_START};
+//! Smoke tests against commercial ROMs from a local library. ROMs are not distributed with
+//! Lockstep; point `LOCKSTEP_ROM_DIR` at your own dumps. Missing ROMs are skipped.
 
-const NES_DIR: &str = "/home/zajones/Projects/NES";
+use lockstep_core::cartridge::Cartridge;
+use lockstep_core::cpu::System;
+use lockstep_core::input::{BTN_A, BTN_START};
+
+/// ROM library location: `$LOCKSTEP_ROM_DIR`, else `../NES` next to the crate.
+fn rom_dir() -> std::path::PathBuf {
+    std::env::var_os("LOCKSTEP_ROM_DIR")
+        .map(Into::into)
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../NES"))
+}
 
 fn load(name: &str) -> Option<System> {
-    let path = format!("{NES_DIR}/{name}");
-    if !std::path::Path::new(&path).exists() {
-        eprintln!("skipping: {path} not found");
+    let path = rom_dir().join(name);
+    if !path.exists() {
+        eprintln!("skipping: {} not found", path.display());
         return None;
     }
     Some(System::new(Cartridge::from_file(&path).expect("load")).expect("mapper"))
@@ -61,4 +70,33 @@ fn overclock_mode_runs_games() {
             run(&mut sys, 600);
         }
     }
+}
+
+#[test]
+fn run_ahead_shows_the_next_frame_early() {
+    let Some(base) = load("Super Mario Bros. (Japan, USA).zip") else { return };
+    let input = |f: u32| if (100..104).contains(&f) { BTN_START } else if f > 200 { lockstep_core::input::BTN_RIGHT | if f % 40 < 15 { BTN_A } else { 0 } } else { 0 };
+    // Reference: plain emulation, recording every frame.
+    let mut plain = base.clone();
+    let mut frames = Vec::new();
+    for f in 0..400 {
+        plain.joypad.buttons_p1 = input(f);
+        plain.run_frame();
+        frames.push(plain.ppu.framebuffer.to_vec());
+    }
+    // Run-ahead 1 with input held constant across the speculative frame: the displayed
+    // image for frame f must equal reference frame f+1 whenever input(f) == input(f+1).
+    let mut ra = base.clone();
+    let mut out = vec![0u8; frames[0].len()];
+    let mut checked = 0;
+    for f in 0..399 {
+        ra.joypad.buttons_p1 = input(f);
+        ra.run_frame_ahead(1, &mut out);
+        assert_eq!(ra.ppu.framebuffer[..], frames[f as usize][..], "real state diverged at {f}");
+        if input(f) == input(f + 1) {
+            assert!(out == frames[f as usize + 1], "run-ahead frame mismatch at {f}");
+            checked += 1;
+        }
+    }
+    assert!(checked > 300);
 }

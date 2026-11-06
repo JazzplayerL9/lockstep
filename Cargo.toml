@@ -1,22 +1,29 @@
 [package]
-name = "nes-rt-emu"
-version = "0.2.0"
+name = "lockstep"
+version = "0.3.0"
 edition = "2024"
-default-run = "nes-rt-emu"
+description = "Cycle-accurate NES emulator with display-locked, low-latency real-time scheduling"
+license = "GPL-3.0-or-later"
+authors = ["Zach Jones <jazzplayerl9@gmail.com>"]
+readme = "README.md"
+keywords = ["nes", "emulator", "famicom", "6502", "realtime"]
+categories = ["emulators"]
+default-run = "lockstep"
 
 [lib]
-name = "nes_core"
+name = "lockstep_core"
 path = "src/lib.rs"
 
 [[bin]]
-name = "nes-rt-emu"
+name = "lockstep"
 path = "src/main.rs"
 
 [[bin]]
-name = "nes-headless"
+name = "lockstep-headless"
 path = "src/bin/headless.rs"
 
 [dependencies]
+cpal = "0.18.2"
 flate2 = "1.1"
 libc = "0.2"
 macroquad = "0.4"

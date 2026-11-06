@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Zach Jones
+
+//! `lockstep`: the graphical front end. A ROM browser plus a window showing the running
+//! game, driven by the real-time emulation thread in [`lockstep_core::rt`].
+//! Run `lockstep --help` for usage, or see README.md.
 
 use std::env;
 use std::fs;
@@ -6,11 +12,38 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use macroquad::prelude::*;
-use nes_core::cartridge::Cartridge;
-use nes_core::input::{BTN_A, BTN_B, BTN_DOWN, BTN_LEFT, BTN_RIGHT, BTN_SELECT, BTN_START, BTN_UP};
-use nes_core::mappers;
-use nes_core::ppu::{SCREEN_HEIGHT, SCREEN_WIDTH};
-use nes_core::rt::{EmulatorCommand, RtSharedState, spawn_emulator_worker};
+use lockstep_core::cartridge::Cartridge;
+use lockstep_core::input::{BTN_A, BTN_B, BTN_DOWN, BTN_LEFT, BTN_RIGHT, BTN_SELECT, BTN_START, BTN_UP};
+use lockstep_core::mappers;
+use lockstep_core::ppu::{SCREEN_HEIGHT, SCREEN_WIDTH};
+use lockstep_core::rt::{DisplayClock, EmulatorCommand, RtSharedState, spawn_emulator_worker};
+
+/// Picks the directory the ROM browser opens in, in order of preference:
+/// 1. the command-line argument (a directory, or the directory of a ROM file),
+/// 2. `$LOCKSTEP_ROM_DIR`,
+/// 3. a `roms`, `ROMs` or `NES` folder in (or next to) the current directory,
+/// 4. the current directory.
+fn initial_rom_dir(arg: Option<&Path>) -> PathBuf {
+    if let Some(p) = arg {
+        if p.is_dir() {
+            return p.to_path_buf();
+        }
+        if let Some(parent) = p.parent().filter(|d| d.is_dir()) {
+            return parent.to_path_buf();
+        }
+    }
+    if let Some(dir) = env::var_os("LOCKSTEP_ROM_DIR").map(PathBuf::from).filter(|d| d.is_dir()) {
+        return dir;
+    }
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    for candidate in ["roms", "ROMs", "NES", "../roms", "../ROMs", "../NES"] {
+        let d = cwd.join(candidate);
+        if d.is_dir() {
+            return d.canonicalize().unwrap_or(d);
+        }
+    }
+    cwd
+}
 
 /// Validates that the cartridge's board is emulated and returns "Title [Mapper]".
 fn describe_cart(cart: &Cartridge) -> Result<String, String> {
@@ -18,9 +51,10 @@ fn describe_cart(cart: &Cartridge) -> Result<String, String> {
     Ok(format!("{} [{}]", cart.title, m.name()))
 }
 
+/// Initial window: 3x the NES resolution, resizable.
 fn window_conf() -> Conf {
     Conf {
-        window_title: "NES-RT Emulator".to_string(),
+        window_title: "Lockstep".to_string(),
         window_width: (SCREEN_WIDTH * 3) as i32,
         window_height: (SCREEN_HEIGHT * 3) as i32,
         window_resizable: true,
@@ -29,6 +63,7 @@ fn window_conf() -> Conf {
     }
 }
 
+/// Keyboard state mapped to NES buttons (`BTN_*` bits) that are currently held.
 fn poll_joypad_buttons() -> u8 {
     let mut mask = 0u8;
 
@@ -63,6 +98,7 @@ fn poll_joypad_buttons() -> u8 {
     mask
 }
 
+/// NES buttons whose key went down this UI frame (latched so short taps aren't lost).
 fn poll_joypad_pressed() -> u8 {
     let mut mask = 0u8;
 
@@ -104,11 +140,14 @@ fn poll_joypad_pressed() -> u8 {
 /// accelerating rate (so long lists can be scrolled by holding Up/Down).
 #[derive(Default)]
 struct KeyRepeat {
+    /// Seconds the key has been held (0 = not held).
     held: f64,
+    /// Hold time at which the next repeat fires.
     next: f64,
 }
 
 impl KeyRepeat {
+    /// Advances by `dt` seconds with the key `down`; returns true when the action should fire.
     fn fire(&mut self, down: bool, dt: f64) -> bool {
         if !down {
             self.held = 0.0;
@@ -131,6 +170,43 @@ impl KeyRepeat {
     }
 }
 
+/// One-line summary of the real-time pipeline for the browser panel.
+fn rt_status_lines(shared: &RtSharedState) -> (String, String) {
+    let period = shared.display_period_ns.load(Ordering::Acquire);
+    let sync = if shared.display_sync_active.load(Ordering::Acquire) {
+        format!(
+            "Display-synced {:.2} Hz (JIT margin {:.1} ms)",
+            1e9 / period as f64,
+            shared.present_margin_ns.load(Ordering::Acquire) as f64 / 1e6
+        )
+    } else if period > 0 {
+        format!("Free-run 60.10 Hz (display {:.1} Hz)", 1e9 / period as f64)
+    } else {
+        "Free-run 60.10 Hz".to_string()
+    };
+    let prio = shared.sched_fifo_prio.load(Ordering::Acquire);
+    let audio = match shared.audio_stats.get() {
+        Some(a) => format!(
+            "Audio buffer {:.1}-{:.1} ms, DRC {:+} ppm, {} underruns{}",
+            a.low_water_us.load(Ordering::Relaxed) as f64 / 1000.0,
+            a.buffered_us.load(Ordering::Relaxed) as f64 / 1000.0,
+            a.drc_ppm.load(Ordering::Relaxed) as i64,
+            a.underruns.load(Ordering::Relaxed),
+            if a.rt_promoted.load(Ordering::Relaxed) { " (RT)" } else { "" }
+        ),
+        None => "audio off".to_string(),
+    };
+    let line1 = format!(
+        "{} | frame cost {:.1} ms | run-ahead {} | {} | max jitter {:.0} us",
+        sync,
+        shared.frame_cost_ns.load(Ordering::Relaxed) as f64 / 1e6,
+        shared.run_ahead.load(Ordering::Acquire),
+        if prio > 0 { format!("SCHED_FIFO {prio}") } else { "SCHED_OTHER".to_string() },
+        shared.max_abs_jitter_ns.load(Ordering::Relaxed) as f64 / 1000.0,
+    );
+    (line1, audio)
+}
+
 /// Truncates `text` with an ellipsis so it fits in `max_w` pixels at `size`.
 fn fit_text(text: &str, max_w: f32, size: u16) -> String {
     if measure_text(text, None, size, 1.0).width <= max_w {
@@ -147,21 +223,31 @@ fn fit_text(text: &str, max_w: f32, size: u16) -> String {
     String::new()
 }
 
+/// One row of the ROM browser.
 #[derive(Clone, Debug)]
 struct DirEntryItem {
+    /// Display text (directories are prefixed with `[DIR]`).
     name: String,
+    /// Full path of the file or directory.
     path: PathBuf,
+    /// Whether Enter descends into it instead of loading it.
     is_dir: bool,
 }
 
+/// The ROM browser overlay: a directory listing of `.nes`/`.zip` files and folders.
 struct RomBrowser {
+    /// Directory being listed.
     current_dir: PathBuf,
+    /// Parent link, then ROMs, then sub-directories, each sorted case-insensitively.
     entries: Vec<DirEntryItem>,
+    /// Index of the highlighted entry.
     selected: usize,
+    /// Message shown above the key help (load errors, unsupported mappers).
     status_msg: String,
 }
 
 impl RomBrowser {
+    /// Opens the browser at `start_dir`.
     fn new(start_dir: PathBuf) -> Self {
         let mut browser = Self {
             current_dir: start_dir,
@@ -173,6 +259,7 @@ impl RomBrowser {
         browser
     }
 
+    /// Re-reads `current_dir` (hidden files are skipped) and clamps the selection.
     fn refresh(&mut self) {
         self.entries.clear();
         if let Some(parent) = self.current_dir.parent() {
@@ -224,9 +311,58 @@ impl RomBrowser {
     }
 }
 
-#[macroquad::main(window_conf)]
-async fn main() {
+/// `--help` text.
+const HELP: &str = "\
+Lockstep - cycle-accurate NES emulator with low-latency real-time scheduling
+
+USAGE:
+    lockstep [ROM_FILE | ROM_DIRECTORY]
+
+    With a ROM (.nes, or a .zip containing one) the game starts immediately; with a
+    directory (or nothing) the ROM browser opens there.
+
+ENVIRONMENT:
+    LOCKSTEP_ROM_DIR   Directory the ROM browser opens in by default
+    LOCKSTEP_RT_PRIO   SCHED_FIFO priority of the emulation thread (default 45)
+    LOCKSTEP_STATS     If set, print real-time statistics to stderr every 2 s
+
+KEYS (in game):
+    Arrows / WASD   D-pad          Z / J / Space   A
+    X / K / LShift  B              Enter           Start
+    RShift / Tab    Select         R               Reset
+    Esc / F1  ROM browser   F2 Unload   F3 RT scheduling   F4 Overclock
+    F5 / F8   Save / load state   F6 Overscan crop   F7 Run-ahead   F11 Fullscreen
+
+See README.md and docs/ for details.";
+
+/// Short GPL notice printed by `--help`/`--version` (as the GPL recommends for interactive programs).
+const LICENSE_NOTICE: &str = "\
+Lockstep  Copyright (C) 2026 Zach Jones
+This program comes with ABSOLUTELY NO WARRANTY. This is free software, and you are
+welcome to redistribute it under the terms of the GNU General Public License, version 3
+or (at your option) any later version. See the LICENSE file for details.";
+
+fn main() {
+    match env::args().nth(1).as_deref() {
+        Some("-h" | "--help") => {
+            println!("{HELP}\n\n{LICENSE_NOTICE}");
+            return;
+        }
+        Some("-V" | "--version") => {
+            println!("lockstep {}\n\n{LICENSE_NOTICE}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        _ => {}
+    }
+    macroquad::Window::from_config(window_conf(), run());
+}
+
+/// The GUI main loop, run once per display refresh:
+/// hotkeys → browser or controller input → wait for the just-in-time frame →
+/// draw → swap → measure the refresh (`DisplayClock`).
+async fn run() {
     let shared = Arc::new(RtSharedState::new());
+    shared.register_ui_thread();
     let (cmd_tx, _worker_handle) = spawn_emulator_worker(Arc::clone(&shared));
 
     let mut image = Image {
@@ -237,21 +373,8 @@ async fn main() {
     let texture = Texture2D::from_image(&image);
     texture.set_filter(FilterMode::Nearest);
 
-    let default_nes_dir = PathBuf::from("/home/zajones/Projects/NES");
-    let initial_dir = if default_nes_dir.is_dir() {
-        default_nes_dir
-    } else {
-        env::current_dir()
-            .ok()
-            .and_then(|d| {
-                if d.ends_with("nes-rt-emu") {
-                    d.parent().map(Path::to_path_buf)
-                } else {
-                    Some(d)
-                }
-            })
-            .unwrap_or_else(|| PathBuf::from("."))
-    };
+    let arg = env::args().nth(1).map(PathBuf::from);
+    let initial_dir = initial_rom_dir(arg.as_deref());
 
     let mut browser = RomBrowser::new(initial_dir);
     let mut show_browser = true;
@@ -267,7 +390,7 @@ async fn main() {
     let mut toast_timer = 0.0f64;
 
     // If a .nes file path was passed on the command line, load it immediately
-    if let Some(arg_path) = env::args().nth(1) {
+    if let Some(arg_path) = arg.filter(|p| p.is_file()) {
         match Cartridge::from_file(&arg_path) {
             Ok(cart) => match describe_cart(&cart) {
                 Ok(info) => {
@@ -286,6 +409,9 @@ async fn main() {
     }
 
     let mut last_time = get_time();
+    let mut display_clock = DisplayClock::new();
+    let mut last_drawn_seq = 0u64;
+    let mut fullscreen = false;
 
     loop {
         let now = get_time();
@@ -348,6 +474,21 @@ async fn main() {
             let _ = cmd_tx.send(EmulatorCommand::LoadState);
             toast_text = "State Loaded (Slot 1)".to_string();
             toast_timer = 2.0;
+        }
+
+        if is_key_pressed(KeyCode::F7) {
+            let next = (shared.run_ahead.load(Ordering::Acquire) + 1) % 3;
+            let _ = cmd_tx.send(EmulatorCommand::SetRunAhead(next));
+            toast_text = match next {
+                0 => "Run-ahead: OFF".to_string(),
+                n => format!("Run-ahead: {n} frame{} (lower input lag)", if n > 1 { "s" } else { "" }),
+            };
+            toast_timer = 2.0;
+        }
+
+        if is_key_pressed(KeyCode::F11) {
+            fullscreen = !fullscreen;
+            set_fullscreen(fullscreen);
         }
 
         if is_key_pressed(KeyCode::F6) {
@@ -420,8 +561,15 @@ async fn main() {
             shared.update_input(held, pressed);
         }
 
-        if let Some(latest_fb) = shared.framebuffer.acquire_latest() {
-            image.bytes.copy_from_slice(latest_fb);
+        // Display sync: wait (bounded) for the frame the worker is producing just in
+        // time for the upcoming refresh, so it is shown with minimum delay.
+        shared.wait_for_jit_frame(last_drawn_seq);
+        last_drawn_seq = shared.frame_seq.load(Ordering::Acquire);
+        if shared
+            .framebuffer
+            .with_latest(|fb| image.bytes.copy_from_slice(fb))
+            .is_some()
+        {
             texture.update(&image);
         }
 
@@ -496,7 +644,7 @@ async fn main() {
             );
 
             draw_text(
-                "NES-RT ROM Launcher & Manager",
+                "Lockstep - NES",
                 panel_x + 18.0,
                 panel_y + 28.0,
                 24.0,
@@ -516,6 +664,16 @@ async fn main() {
                 16.0,
                 LIGHTGRAY,
             );
+            let (rt1, rt2) = rt_status_lines(&shared);
+            for (i, line) in [rt1, rt2].iter().enumerate() {
+                draw_text(
+                    &fit_text(line, text_w, 16),
+                    panel_x + 18.0,
+                    panel_y + 94.0 + i as f32 * 20.0,
+                    16.0,
+                    Color::new(0.6, 0.9, 0.7, 1.0),
+                );
+            }
             draw_text(
                 &fit_text(&format!("Directory: {}", browser.current_dir.display()), text_w, 16),
                 panel_x + 18.0,
@@ -524,9 +682,9 @@ async fn main() {
                 GRAY,
             );
 
-            let list_top = panel_y + 92.0;
+            let list_top = panel_y + 142.0;
             let row_h = 24.0;
-            let max_visible = ((panel_h - 160.0) / row_h).max(1.0) as usize;
+            let max_visible = ((panel_h - 228.0) / row_h).max(1.0) as usize;
             let start_idx = browser
                 .selected
                 .saturating_sub(max_visible / 2)
@@ -557,11 +715,22 @@ async fn main() {
             draw_text(
                 &fit_text(&browser.status_msg, text_w, 16),
                 panel_x + 18.0,
-                footer_y - 40.0,
+                footer_y - 38.0,
                 16.0,
                 Color::new(1.0, 0.85, 0.55, 1.0),
             );
             let help = Color::new(0.70, 0.85, 0.95, 1.0);
+            draw_text(
+                &fit_text(
+                    concat!("Lockstep ", env!("CARGO_PKG_VERSION"), " - free software under GPL-3.0-or-later, ABSOLUTELY NO WARRANTY (see LICENSE)"),
+                    text_w,
+                    14,
+                ),
+                panel_x + 18.0,
+                footer_y - 58.0,
+                14.0,
+                GRAY,
+            );
             draw_text(
                 &fit_text("Up/Down (hold to scroll)  Left/Right/PgUp/PgDn: Page  Home/End  Enter: Load  Backspace: Up Dir", text_w, 15),
                 panel_x + 18.0,
@@ -570,7 +739,7 @@ async fn main() {
                 help,
             );
             draw_text(
-                &fit_text("Esc/F1: Back to game  F2: Unload  F3: RT sched  F4: Overclock  F5/F8: Save/Load state  F6: Crop  R: Reset", text_w, 15),
+                &fit_text("Esc/F1: Game  F2: Unload  F3: RT  F4: Overclock  F5/F8: State  F6: Crop  F7: Run-ahead  F11: Fullscreen  R: Reset", text_w, 15),
                 panel_x + 18.0,
                 footer_y,
                 15.0,
@@ -579,6 +748,7 @@ async fn main() {
         }
 
         next_frame().await;
+        display_clock.tick(&shared, shared.display_sync_active.load(Ordering::Acquire));
     }
 }
 

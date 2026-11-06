@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Zach Jones
+//
+// Portions derived from Mesen (https://github.com/nesdev-org/MesenCE):
+// the CPU core, interrupt polling and DMA engine.
+// Mesen is Copyright (C) 2014-2026 Sour and contributors, GPL-3.0-or-later.
+
 //! Ricoh 2A03 CPU core and system bus. Every bus access is one CPU cycle and advances
 //! the PPU through a shared master clock (12 master clocks per CPU cycle, 4 per PPU dot,
 //! split around the access so reads/writes land on the correct PPU dot). Dummy reads and
@@ -10,41 +17,88 @@ use crate::input::Joypad;
 use crate::mappers::{self, Mapper};
 use crate::ppu::Ppu;
 
+/// Status flag bit 0: carry.
 const C: u8 = 0x01;
+/// Status flag bit 1: zero (set when a result is 0).
 const Z: u8 = 0x02;
+/// Status flag bit 2: IRQ disable. Masks IRQs (not NMI or BRK). Because `end_cycle` samples
+/// it when computing `run_irq`, a change made by CLI/SEI/PLP only takes effect on the next
+/// instruction's poll, which reproduces the 6502's one-instruction latency for those opcodes.
 const I: u8 = 0x04;
+/// Status flag bit 3: decimal mode. Settable via SED/CLD/PLP/RTI but ignored by ADC/SBC,
+/// since the 2A03 has no BCD unit.
 const D: u8 = 0x08;
+/// Status bit 4: "break". Not a real register bit; only set in the copy pushed by
+/// BRK/PHP (clear when pushed by an IRQ/NMI) and masked off again by PLP/RTI.
 const B: u8 = 0x10;
+/// Status bit 5: unused. Always reads as 1 in pushed copies; masked off by PLP/RTI.
 const U: u8 = 0x20;
+/// Status flag bit 6: signed overflow (ADC/SBC, BIT copies operand bit 6).
 const V: u8 = 0x40;
+/// Status flag bit 7: negative (bit 7 of a result; BIT copies operand bit 7).
 const N: u8 = 0x80;
 
 /// Extra idle PPU scanlines inserted before VBlank when the "overclock" option is on.
 pub const OVERCLOCK_SCANLINES: u16 = 100;
 
+/// 6502 addressing mode of an opcode, selecting how [`System::fetch_operand`] fetches the
+/// operand and which dummy reads it performs. Every access listed is one CPU cycle.
+///
+/// The `*W` ("write") variants are used by stores and read-modify-write instructions: unlike
+/// the plain indexed modes, they always do the dummy read of the un-carried address, because
+/// the CPU can't know whether the high byte still needs fixing before a write.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
+    /// Implied: operand is implicit. One dummy read of the byte at PC (PC not incremented).
     Imp,
+    /// Accumulator (ASL A etc.): same bus behaviour as [`Mode::Imp`] (one dummy read at PC).
     Acc,
+    /// Immediate: the operand byte at PC is read (and PC incremented); it is the value itself.
     Imm,
+    /// Relative (branches): reads the signed 8-bit offset at PC. The taken/page-cross cycles
+    /// are added by [`System::branch`].
     Rel,
+    /// Zero page: reads an 8-bit address from PC; the effective address is $00xx.
     Zero,
+    /// Zero page,X: reads the base address, does a dummy read of the un-indexed zero-page
+    /// address, then adds X with wraparound within page zero.
     ZeroX,
+    /// Zero page,Y: like [`Mode::ZeroX`] but indexed by Y (LDX/STX/LAX/SAX).
     ZeroY,
+    /// Indirect (JMP ($xxxx) only): `fetch_operand` reads just the 16-bit pointer; the target
+    /// is read in `execute`, reproducing the page-wrap bug (high byte fetched from $xx00).
     Ind,
+    /// (Indirect,X): reads the zero-page pointer, dummy-reads it, adds X (wrapping in page
+    /// zero) and reads the 16-bit target address from there (high byte also wraps in page zero).
     IndX,
+    /// (Indirect),Y for reads: reads the zero-page pointer and the 16-bit base, adds Y. A
+    /// dummy read of the un-carried address (high byte not yet fixed) happens only when
+    /// adding Y crosses a page, giving the extra cycle on a page cross.
     IndY,
+    /// (Indirect),Y for writes / RMW: like [`Mode::IndY`] but the dummy read at the
+    /// (possibly un-carried) address is always performed, page cross or not.
     IndYW,
+    /// Absolute: reads a 16-bit address from PC (low byte first).
     Abs,
+    /// Absolute,X for reads: reads the 16-bit base and adds X; the dummy read of the
+    /// un-carried address (base high byte + low byte of base+X) occurs only on a page cross.
     AbsX,
+    /// Absolute,X for writes / RMW: like [`Mode::AbsX`] but always performs the dummy read.
     AbsXW,
+    /// Absolute,Y for reads: like [`Mode::AbsX`] indexed by Y (dummy read only on page cross).
     AbsY,
+    /// Absolute,Y for writes / RMW: like [`Mode::AbsY`] but always performs the dummy read.
     AbsYW,
+    /// No generic operand fetch: `fetch_operand` does nothing and `execute` performs all bus
+    /// cycles itself (JSR, KIL, and the SHY/SHX/SHA/TAS stores).
     Other,
 }
 
 use Mode::*;
 
+/// Addressing mode for each of the 256 opcodes (official and unofficial), indexed by
+/// opcode byte; row = high nibble, column = low nibble. Used by `step_instruction` to choose
+/// the operand fetch. Stores and RMW opcodes use the `*W` modes so their dummy read always happens.
 #[rustfmt::skip]
 static ADDR_MODE: [Mode; 256] = [
 //  0      1      2      3      4      5      6      7      8      9      A      B      C      D      E      F
@@ -66,50 +120,116 @@ static ADDR_MODE: [Mode; 256] = [
     Rel,   IndY,  Other, IndYW, ZeroX, ZeroX, ZeroX, ZeroX, Imp,   AbsY,  Imp,   AbsYW, AbsX,  AbsX,  AbsXW, AbsXW, // F
 ];
 
+/// A complete NES: the 2A03 CPU (registers and DMA engine), 2 KB of work RAM, the PPU,
+/// APU, controller ports and the cartridge mapper, all driven from one master clock.
+///
+/// The CPU is the scheduler: every bus access it makes is exactly one CPU cycle, during which
+/// the PPU advances three dots and the APU one cycle. See `docs/ARCHITECTURE.md`.
+///
+/// `System` is `Clone`; a clone is a complete save state (ROM data is shared, not copied).
 #[derive(Clone)]
 pub struct System {
+    /// Accumulator.
     pub a: u8,
+    /// X index register.
     pub x: u8,
+    /// Y index register.
     pub y: u8,
+    /// Stack pointer (the stack lives at $0100-$01FF).
     pub sp: u8,
+    /// Program counter.
     pub pc: u16,
+    /// Processor status flags (NV-BDIZC). Bits 4 and 5 only exist when pushed.
     pub status: u8,
+    /// CPU cycles executed since power-on (wraps; starts at `u64::MAX` so the first cycle is 0).
     pub cycle_count: u64,
+    /// Master clock counter (21.477 MHz NTSC ticks), 12 per CPU cycle. Each cycle is split
+    /// in two halves to place the bus access on the right PPU dot: reads add 5 in `start_cycle`
+    /// and 7 in `end_cycle`, writes add 7 then 5 (Mesen's start/end clock counts of 6 +/- 1).
+    /// The PPU is run up to `master_clock - 1` after each half.
     master_clock: u64,
+    /// Operand of the current instruction as resolved by `fetch_operand`: the effective
+    /// address for memory modes, or the immediate/relative byte for `Imm`/`Rel` (0 for `Imp`/`Acc`/`Other`).
     operand: u16,
+    /// Addressing mode of the instruction currently executing (from [`ADDR_MODE`]).
     mode: Mode,
 
     // Interrupt state.
+    /// Level of the PPU's NMI output as sampled at the end of the previous CPU cycle; used by
+    /// the edge detector in `end_cycle` (a low-to-high transition of `ppu.nmi_line` sets `need_nmi`).
     prev_nmi_line: bool,
+    /// NMI edge latched: set by `end_cycle` on a rising edge of the PPU NMI line and held until
+    /// an NMI is serviced (`interrupt`, or BRK hijacked into the NMI vector), or cleared by reset.
     need_nmi: bool,
+    /// `need_nmi` as it was one cycle earlier. Interrupts are polled on an instruction's
+    /// penultimate cycle: after the last cycle, `step_instruction` checks this delayed copy, so an
+    /// NMI detected during the final cycle waits for the following instruction.
     prev_need_nmi: bool,
+    /// IRQ wanted at the end of the current cycle: (mapper IRQ or APU IRQ line asserted) and
+    /// the I flag clear. Recomputed by `end_cycle` every cycle (level-sensitive, not latched).
     run_irq: bool,
+    /// `run_irq` from one cycle earlier, i.e. the value polled on the instruction's
+    /// penultimate cycle. `step_instruction` runs `interrupt` if this (or `prev_need_nmi`) is set.
+    /// `branch` manipulates it to model taken-branch IRQ delay.
     prev_run_irq: bool,
 
     // DMA state.
+    /// A DMA (OAM via a $4014 write, or a DMC sample fetch) has been requested and the CPU
+    /// must halt on its next read cycle. Checked by `read`; writes never halt, so DMA waits
+    /// until the CPU's next read. Cleared when the halt cycle is consumed.
     need_halt: bool,
+    /// DMC DMA still needs its dummy (alignment) cycle after the halt cycle before it may do
+    /// its sample read. Set by `start_dmc_transfer`, consumed by `dma_cycle_prologue`.
     need_dummy_read: bool,
+    /// OAM DMA ($4014) in progress: 256 read/write pairs copying page `sprite_dma_page` to $2004.
     sprite_dma: bool,
+    /// High byte of the source address for OAM DMA (the value written to $4014).
     sprite_dma_page: u8,
+    /// A DMC sample-byte DMA is pending/in progress (requested by the APU via
+    /// `DmcDmaRequest::Start`). Cleared after the DMC read completes or when aborted.
     dmc_dma_running: bool,
+    /// The APU cancelled a DMC DMA (`DmcDmaRequest::Stop`) after its halt cycle had already
+    /// happened; the DMA engine drops the transfer on its next cycle instead of reading.
     abort_dmc_dma: bool,
 
     /// CPU executed a KIL/JAM opcode.
     pub jammed: bool,
+    /// Last value driven on the CPU data bus (by any read or write, except $4015 reads which
+    /// only use the internal bus). Returned for unmapped addresses and used for the undriven
+    /// upper bits of $4016/$4017 and bit 5 of $4015.
     open_bus: u8,
+    /// CPU cycles during which the APU was not clocked because the PPU had `apu_enabled`
+    /// clear (the overclock's extra scanlines). If odd, `start_cycle` clocks the APU once more
+    /// when it resumes to keep its odd/even (put/get) cycle phase consistent.
     apu_skipped_cycles: u64,
 
+    /// The console's 2 KB of internal work RAM ($0000-$07FF, mirrored to $1FFF).
     pub ram: [u8; 2048],
+    /// Picture processing unit.
     pub ppu: Ppu,
+    /// Audio processing unit.
     pub apu: Apu,
+    /// The cartridge: ROM/RAM and its bank-switching / IRQ hardware.
     pub mapper: Box<dyn Mapper>,
+    /// Controller ports ($4016/$4017).
     pub joypad: Joypad,
+    /// Whether idle "overclock" scanlines are inserted before VBlank (see [`System::set_overclock`]).
     pub overclock_enabled: bool,
+    /// Cached `mapper.wants_cpu_clock()`: whether `start_cycle` must call `mapper.cpu_clock()`
+    /// every CPU cycle (cached to avoid a virtual call per cycle for boards that don't need it).
+    mapper_clock: bool,
+    /// Cached `mapper.has_expansion_audio()`: whether `start_cycle` must fetch the mapper's
+    /// expansion audio sample into `apu.expansion` every cycle.
+    mapper_audio: bool,
+    /// Game title (from the ROM file name).
     pub title: String,
+    /// Copy of the cartridge header/metadata with PRG/CHR ROM stripped, kept only so
+    /// `save_sram` knows whether there is a battery and where the `.sav` file goes.
     cart_for_sram: Cartridge,
 }
 
 impl System {
+    /// Powers on a console with `cart` inserted. Fails if the cartridge's board (mapper) isn't emulated.
     pub fn new(cart: Cartridge) -> Result<Self, String> {
         let mapper = mappers::create_mapper(&cart)?;
         let mut cart_for_sram = cart;
@@ -148,9 +268,14 @@ impl System {
             mapper,
             joypad: Joypad::new(),
             overclock_enabled: false,
+            mapper_clock: false,
+            mapper_audio: false,
             title,
             cart_for_sram,
         };
+        sys.mapper_clock = sys.mapper.wants_cpu_clock();
+        sys.mapper_audio = sys.mapper.has_expansion_audio();
+        sys.ppu.vram_hook = sys.mapper.wants_vram_addr();
         sys.power_on();
         Ok(sys)
     }
@@ -160,6 +285,8 @@ impl System {
         Self::new(cart).expect("unsupported cartridge")
     }
 
+    /// Power-on: loads PC from the reset vector ($FFFC) with a side-effect-free peek, resets
+    /// the cycle counters (master clock starts at 12) and runs the 8 cycles of the reset sequence.
     fn power_on(&mut self) {
         self.pc = self.peek_u16(0xFFFC);
         self.cycle_count = u64::MAX;
@@ -180,8 +307,10 @@ impl System {
         self.run_irq = false;
         self.prev_run_irq = false;
         self.need_halt = false;
+        self.need_dummy_read = false;
         self.sprite_dma = false;
         self.dmc_dma_running = false;
+        self.abort_dmc_dma = false;
         self.jammed = false;
         self.ppu.reset();
         self.apu.reset();
@@ -192,14 +321,19 @@ impl System {
         }
     }
 
+    /// Writes battery-backed cartridge RAM to the `.sav` file next to the ROM (no-op without a battery).
     pub fn save_sram(&self) {
         self.cart_for_sram.save_battery_sram(&self.mapper.battery_ram());
     }
 
+    /// Human-readable board name, e.g. `"MMC3 (4)"`.
     pub fn mapper_name(&self) -> &'static str {
         self.mapper.name()
     }
 
+    /// Enables/disables the overclock: [`OVERCLOCK_SCANLINES`] extra idle scanlines before VBlank,
+    /// giving games more CPU time per frame (reduces slowdown) without changing the video or
+    /// audio rate. Takes effect at the next frame boundary.
     #[inline]
     pub fn set_overclock(&mut self, on: bool) {
         self.overclock_enabled = on;
@@ -208,6 +342,8 @@ impl System {
 
     // ---------------------------------------------------------------- frame loop
 
+    /// Emulates until the PPU has finished drawing a frame (scanline 240).
+    /// The finished image is in `ppu.framebuffer`, and audio in `apu.audio_samples`.
     pub fn run_frame(&mut self) {
         self.ppu.extra_scanlines = if self.overclock_enabled { OVERCLOCK_SCANLINES } else { 0 };
         self.ppu.frame_complete = false;
@@ -221,22 +357,48 @@ impl System {
         }
     }
 
+    /// Runs one real frame, then (if `ahead` > 0) speculatively runs `ahead` more frames
+    /// with the same input, copies that future frame into `out`, and rolls back. The
+    /// real frame's audio is left in `apu.audio_samples`. This hides the game's own
+    /// 1-2 frames of input lag ("run-ahead").
+    pub fn run_frame_ahead(&mut self, ahead: u8, out: &mut [u8]) {
+        self.run_frame();
+        if ahead == 0 {
+            out.copy_from_slice(&self.ppu.framebuffer);
+            return;
+        }
+        let snapshot = self.clone();
+        for _ in 0..ahead {
+            self.run_frame();
+        }
+        out.copy_from_slice(&self.ppu.framebuffer);
+        *self = snapshot;
+    }
+
     // ---------------------------------------------------------------- clocking
 
+    /// First half of a CPU cycle: advances the master clock (5 for a read, 7 for a write), runs
+    /// the PPU up to it, increments `cycle_count`, clocks the mapper (if it wants CPU clocks) and
+    /// the APU, and handles any DMC DMA start/stop the APU requested this cycle. While the PPU is
+    /// in overclock lines (`apu_enabled` false) the APU is not clocked and the skipped cycles counted.
     #[inline]
     fn start_cycle(&mut self, read: bool) {
         self.master_clock += if read { 5 } else { 7 };
         self.ppu.run(self.master_clock - 1, &mut *self.mapper);
         self.cycle_count = self.cycle_count.wrapping_add(1);
         self.ppu.cpu_cycle = self.cycle_count;
-        self.mapper.cpu_clock();
+        if self.mapper_clock {
+            self.mapper.cpu_clock();
+        }
         if self.ppu.apu_enabled {
             if self.apu_skipped_cycles & 1 == 1 {
                 // Re-sync APU odd/even phase after overclock lines.
                 self.apu.clock();
             }
             self.apu_skipped_cycles = 0;
-            self.apu.expansion = self.mapper.audio_sample();
+            if self.mapper_audio {
+                self.apu.expansion = self.mapper.audio_sample();
+            }
             self.apu.clock();
             match std::mem::take(&mut self.apu.dma_request) {
                 DmcDmaRequest::Start => self.start_dmc_transfer(),
@@ -248,6 +410,11 @@ impl System {
         }
     }
 
+    /// Second half of a CPU cycle: advances the master clock (7 for a read, 5 for a write),
+    /// runs the PPU, then polls the interrupt lines. Shifts `need_nmi`/`run_irq` into their `prev_*`
+    /// copies, edge-detects the PPU NMI line, and recomputes `run_irq` from the mapper/APU IRQ
+    /// lines and the I flag. The `prev_*` values are what `step_instruction` acts on, giving
+    /// polling on the penultimate cycle of each instruction.
     #[inline]
     fn end_cycle(&mut self, read: bool) {
         self.master_clock += if read { 7 } else { 5 };
@@ -264,12 +431,17 @@ impl System {
         self.run_irq = (self.mapper.irq() || self.apu.irq_line()) && self.status & I == 0;
     }
 
+    /// Requests a DMC sample DMA: the CPU will halt on its next read, spend a dummy cycle, then
+    /// fetch the byte (see `process_pending_dma`).
     fn start_dmc_transfer(&mut self) {
         self.dmc_dma_running = true;
         self.need_dummy_read = true;
         self.need_halt = true;
     }
 
+    /// Cancels a pending DMC DMA (the APU disabled the channel). If the halt hasn't happened
+    /// yet the request is simply dropped; otherwise `abort_dmc_dma` is set so the in-progress DMA
+    /// engine abandons it.
     fn stop_dmc_transfer(&mut self) {
         if self.dmc_dma_running {
             if self.need_halt {
@@ -291,6 +463,10 @@ impl System {
         (hi << 8) | lo
     }
 
+    /// Performs a CPU-bus read with side effects (PPU/APU/joypad registers, mapper), without
+    /// advancing time. Updates `open_bus` with the result, except for $4015 which doesn't drive
+    /// the external bus. $4000-$401F registers that aren't readable return open bus; unmapped
+    /// cartridge space returns open bus.
     fn bus_read(&mut self, addr: u16) -> u8 {
         let v = match addr {
             0x0000..=0x1FFF => self.ram[(addr & 0x7FF) as usize],
@@ -309,6 +485,9 @@ impl System {
         v
     }
 
+    /// Performs a CPU-bus write without advancing time and sets `open_bus` to `val`. $2000-$3FFF
+    /// also notifies the mapper (for boards that snoop PPU register writes); $4014 schedules OAM
+    /// DMA (which starts at the next read); $4018-$401F are ignored; $4020+ goes to the mapper.
     fn bus_write(&mut self, addr: u16, val: u8) {
         self.open_bus = val;
         match addr {
@@ -329,6 +508,8 @@ impl System {
         }
     }
 
+    /// One full CPU read cycle at `addr`. If a DMA is pending, the CPU is halted here first
+    /// and `process_pending_dma` runs the stolen cycles before this read happens.
     #[inline]
     fn read(&mut self, addr: u16) -> u8 {
         if self.need_halt {
@@ -340,6 +521,7 @@ impl System {
         v
     }
 
+    /// One full CPU write cycle. DMA never halts the CPU on a write cycle.
     #[inline]
     fn write(&mut self, addr: u16, val: u8) {
         self.start_cycle(false);
@@ -347,11 +529,23 @@ impl System {
         self.end_cycle(false);
     }
 
+    /// Read performed by the DMA unit (OAM source byte or DMC sample). Reads of $4015-$401A
+    /// return open bus because DMA can't see the 2A03's internal registers. (Mesen's extra glitch
+    /// where a halted read in $4000-$401F lets the CPU read internal registers is not modelled.)
     fn dma_read(&mut self, addr: u16) -> u8 {
         // DMA can't see the 2A03's internal registers.
         if (0x4015..=0x401A).contains(&addr) { self.open_bus } else { self.bus_read(addr) }
     }
 
+    /// Runs the DMA engine, ported from Mesen's `ProcessPendingDma`. Called by `read` when
+    /// `need_halt` is set, with the address the CPU was about to read.
+    ///
+    /// The first cycle is the halt cycle, repeating the CPU's read of `read_addr`. Then cycles
+    /// alternate get (even `cycle_count`) / put (odd): on get cycles a ready DMC DMA (halt and
+    /// dummy consumed) reads its byte and has priority, otherwise OAM DMA reads its next byte,
+    /// otherwise a dummy re-read of `read_addr` aligns the transfer. On put cycles OAM DMA writes
+    /// the byte it just read to $2004, or a dummy read is done. OAM DMA thus takes 513-514 cycles
+    /// (plus any DMC steals). Returns when neither DMA is active; the CPU's read then proceeds.
     fn process_pending_dma(&mut self, read_addr: u16) {
         self.need_halt = false;
         // Halt cycle (repeats the CPU's read).
@@ -417,6 +611,9 @@ impl System {
         }
     }
 
+    /// Bookkeeping at the start of each DMA cycle (Mesen's `processCycle`): consumes a pending
+    /// DMC abort, or else one outstanding DMC halt or dummy cycle. OAM DMA cycles therefore also
+    /// count as the DMC's halt/dummy cycles when the two overlap.
     #[inline]
     fn dma_cycle_prologue(&mut self) {
         if self.abort_dmc_dma {
@@ -433,11 +630,13 @@ impl System {
 
     // ---------------------------------------------------------------- helpers
 
+    /// Dummy read of the byte at PC without incrementing PC (one cycle).
     #[inline]
     fn dummy_pc_read(&mut self) {
         self.read(self.pc);
     }
 
+    /// Reads the byte at PC and increments PC (one cycle).
     #[inline]
     fn read_byte(&mut self) -> u8 {
         let v = self.read(self.pc);
@@ -445,6 +644,7 @@ impl System {
         v
     }
 
+    /// Reads a little-endian 16-bit word at PC, advancing PC by 2 (two cycles).
     #[inline]
     fn read_word(&mut self) -> u16 {
         let lo = self.read_byte() as u16;
@@ -452,6 +652,7 @@ impl System {
         (hi << 8) | lo
     }
 
+    /// Reads a little-endian 16-bit word at `addr`/`addr+1` (two cycles). Used for vectors.
     #[inline]
     fn read_u16(&mut self, addr: u16) -> u16 {
         let lo = self.read(addr) as u16;
@@ -459,24 +660,28 @@ impl System {
         (hi << 8) | lo
     }
 
+    /// Pushes a byte to the stack at $0100+SP and decrements SP (one write cycle).
     #[inline]
     fn push(&mut self, v: u8) {
         self.write(0x100 | self.sp as u16, v);
         self.sp = self.sp.wrapping_sub(1);
     }
 
+    /// Pushes a 16-bit value, high byte first (two write cycles).
     #[inline]
     fn push16(&mut self, v: u16) {
         self.push((v >> 8) as u8);
         self.push(v as u8);
     }
 
+    /// Increments SP and reads the byte at $0100+SP (one cycle).
     #[inline]
     fn pop(&mut self) -> u8 {
         self.sp = self.sp.wrapping_add(1);
         self.read(0x100 | self.sp as u16)
     }
 
+    /// Pops a 16-bit value, low byte first (two cycles).
     #[inline]
     fn pop16(&mut self) -> u16 {
         let lo = self.pop() as u16;
@@ -484,11 +689,14 @@ impl System {
         (hi << 8) | lo
     }
 
+    /// Dummy read of $0100+SP (the cycle in which the 6502 increments SP for PLA/PLP/RTS/RTI,
+    /// or JSR's internal cycle). One cycle.
     #[inline]
     fn dummy_stack_read(&mut self) {
         self.read(0x100 | self.sp as u16);
     }
 
+    /// Sets Z and N from `v`.
     #[inline]
     fn set_zn(&mut self, v: u8) {
         self.status &= !(Z | N);
@@ -498,11 +706,13 @@ impl System {
         self.status |= v & N;
     }
 
+    /// Whether status flag `f` (one of the flag bit constants) is set.
     #[inline]
     fn flag(&self, f: u8) -> bool {
         self.status & f != 0
     }
 
+    /// Sets or clears status flag `f`.
     #[inline]
     fn set_flag(&mut self, f: u8, on: bool) {
         if on {
@@ -512,11 +722,17 @@ impl System {
         }
     }
 
+    /// Whether adding the unsigned index `b` to address `a` changes the high byte.
     #[inline]
     fn page_crossed(a: u16, b: u8) -> bool {
         (a.wrapping_add(b as u16) & 0xFF00) != (a & 0xFF00)
     }
 
+    /// Performs the addressing-mode cycles for the current `mode` (after the opcode fetch) and
+    /// returns the operand: the effective address for memory modes, the byte itself for
+    /// `Imm`/`Rel`, or 0 for `Imp`/`Acc` (after their dummy PC read) and `Other` (no cycles).
+    /// Includes the dummy reads described on [`Mode`]; on page crosses the dummy read targets the
+    /// address with the un-carried high byte, as on real hardware.
     fn fetch_operand(&mut self) -> u16 {
         match self.mode {
             Acc | Imp => {
@@ -579,6 +795,8 @@ impl System {
         }
     }
 
+    /// Value for a read instruction: the immediate byte for `Imm`/`Rel`/`Imp`/`Acc`/`Other`
+    /// (no bus access), otherwise one read cycle at the effective address.
     #[inline]
     fn operand_value(&mut self) -> u8 {
         match self.mode {
@@ -587,6 +805,7 @@ impl System {
         }
     }
 
+    /// Binary ADC: A = A + v + C, setting C, V, Z and N. SBC is `add(v ^ 0xFF)`. No decimal mode.
     fn add(&mut self, v: u8) {
         let c = (self.status & C) as u16;
         let r = self.a as u16 + v as u16 + c;
@@ -596,11 +815,13 @@ impl System {
         self.set_zn(self.a);
     }
 
+    /// Compare (CMP/CPX/CPY/DCP): C = `reg >= v`, Z/N from `reg - v`.
     fn cmp(&mut self, reg: u8, v: u8) {
         self.set_flag(C, reg >= v);
         self.set_zn(reg.wrapping_sub(v));
     }
 
+    /// Arithmetic shift left; C = old bit 7. Returns the result and sets Z/N.
     fn asl(&mut self, v: u8) -> u8 {
         self.set_flag(C, v & 0x80 != 0);
         let r = v << 1;
@@ -608,6 +829,7 @@ impl System {
         r
     }
 
+    /// Logical shift right; C = old bit 0. Returns the result and sets Z/N.
     fn lsr(&mut self, v: u8) -> u8 {
         self.set_flag(C, v & 1 != 0);
         let r = v >> 1;
@@ -615,6 +837,7 @@ impl System {
         r
     }
 
+    /// Rotate left through carry; C = old bit 7. Returns the result and sets Z/N.
     fn rol(&mut self, v: u8) -> u8 {
         let c = self.status & C;
         self.set_flag(C, v & 0x80 != 0);
@@ -623,6 +846,7 @@ impl System {
         r
     }
 
+    /// Rotate right through carry; C = old bit 0. Returns the result and sets Z/N.
     fn ror(&mut self, v: u8) -> u8 {
         let c = (self.status & C) << 7;
         self.set_flag(C, v & 1 != 0);
@@ -642,10 +866,19 @@ impl System {
         r
     }
 
+    /// Conditional branch using the relative offset in `operand`. Not taken: no extra cycles.
+    /// Taken: one dummy read at PC, plus a dummy read at the un-carried target if a page is crossed.
+    ///
+    /// Interrupt timing (as in Mesen): branches poll on their 2nd and 4th cycles. Restoring
+    /// `run_irq` to `prev_run_irq` before the extra cycle discards an IRQ that first appears in
+    /// the taken branch's last cycle, so one more instruction runs before the IRQ. On a page cross
+    /// the two polls are ORed so an IRQ seen at either poll is taken.
     fn branch(&mut self, cond: bool) {
         let offset = self.operand as u8 as i8;
         if cond {
-            // A taken non-crossing branch delays interrupts by one instruction.
+            // Taken branches poll interrupts on their 2nd cycle (restore that sample here)
+            // and, if a page is crossed, again on their 4th; a non-crossing taken branch
+            // therefore delays a newly arrived interrupt by one instruction.
             self.run_irq = self.prev_run_irq;
             self.dummy_pc_read();
             let target = self.pc.wrapping_add(offset as i16 as u16);
@@ -657,6 +890,10 @@ impl System {
         }
     }
 
+    /// Store for the unstable SHY/SHX/SHA/TAS opcodes (Mesen's `SyaSxaAxa`): dummy read at the
+    /// un-carried address, then write `value & (base_high + 1)`. On a page cross the written
+    /// address's high byte is also ANDed with `value`. If DMA interrupted the dummy read (it took
+    /// more than one cycle) the AND with the high byte is skipped and `value` is written unmodified.
     fn sh_store(&mut self, base: u16, index: u8, value: u8) {
         let crossed = Self::page_crossed(base, index);
         let before = self.cycle_count;
@@ -675,6 +912,10 @@ impl System {
 
     // ---------------------------------------------------------------- interrupts
 
+    /// Hardware interrupt sequence (7 cycles): two dummy reads at PC, push PC and status (with
+    /// B clear, U set), set I, load PC from the vector. The vector is chosen when the status is
+    /// pushed: if an NMI is pending by then it uses $FFFA (NMI hijacks an IRQ) and clears
+    /// `need_nmi`, otherwise $FFFE.
     fn interrupt(&mut self) {
         self.dummy_pc_read();
         self.dummy_pc_read();
@@ -693,6 +934,8 @@ impl System {
 
     // ---------------------------------------------------------------- execute
 
+    /// Executes one CPU instruction (and any interrupt that becomes pending), advancing the
+    /// PPU/APU in step with every bus cycle.
     pub fn step_instruction(&mut self) {
         let op = self.read_byte();
         self.mode = ADDR_MODE[op as usize];
@@ -703,6 +946,11 @@ impl System {
         }
     }
 
+    /// Executes opcode `op` after `fetch_operand` has set `operand`. Covers all 256 opcodes
+    /// (official, unofficial NOP/LAX/SAX/SLO/RLA/SRE/RRA/DCP/ISC/ANC/ALR/ARR/LXA/ANE/AXS/LAS, the
+    /// SHx/TAS stores, and KIL, which rewinds PC and sets `jammed`). BRK checks `need_nmi` like
+    /// `interrupt` (NMI can hijack it) and clears `prev_need_nmi` so the handler's first
+    /// instruction runs before another NMI is taken.
     fn execute(&mut self, op: u8) {
         match op {
             // Loads

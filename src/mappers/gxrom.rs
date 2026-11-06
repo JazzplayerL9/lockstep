@@ -1,15 +1,30 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Zach Jones
+
 //! 32 KB PRG + 8 KB CHR latch boards: GxROM (66), Color Dreams (11),
 //! BNROM / NINA-001 (34), NINA-03/06 (79).
 
 use super::{CartBase, Mapper};
 
+/// Simple discrete-logic boards with a 32 KB PRG bank and an 8 KB (or 2x4 KB) CHR
+/// bank, distinguished by `id`:
+/// - 66 GxROM: $8000-$FFFF, bits 4-5 = PRG bank, bits 0-1 = CHR bank (bus conflicts).
+/// - 11 Color Dreams: $8000-$FFFF, bits 0-1 = PRG bank, bits 4-7 = CHR bank (bus conflicts).
+/// - 34 BNROM: $8000-$FFFF selects the 32 KB PRG bank (bus conflicts), CHR-RAM.
+/// - 34 NINA-001 (detected by > 8 KB CHR-ROM): $7FFD = PRG bank (bit 0),
+///   $7FFE / $7FFF = 4 KB CHR banks for $0000 / $1000 (bits 0-3); the writes also
+///   land in the underlying PRG-RAM.
+/// - 79 NINA-03/06: $4100-$5FFF with A8 set, bit 3 = PRG bank, bits 0-2 = CHR bank.
 #[derive(Clone)]
 pub struct GxRom {
+    /// Shared PRG/CHR/nametable state; bank registers are applied directly to it.
     base: CartBase,
+    /// iNES mapper number (11, 34, 66 or 79) selecting the register layout above.
     id: u16,
 }
 
 impl GxRom {
+    /// Maps PRG bank 0 and CHR bank 0, taking the board variant from `base.mapper_id`.
     pub fn new(mut base: CartBase) -> Self {
         let id = base.mapper_id;
         base.set_prg_32k(0);
@@ -17,6 +32,8 @@ impl GxRom {
         Self { base, id }
     }
 
+    /// True for the mapper 34 NINA-001 variant, told apart from BNROM by having more
+    /// than 8 KB of CHR-ROM (BNROM uses CHR-RAM).
     fn nina001(&self) -> bool {
         self.id == 34 && self.base.chr_rom.len() > 0x2000
     }

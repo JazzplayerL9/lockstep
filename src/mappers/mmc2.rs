@@ -1,21 +1,47 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Zach Jones
+//
+// Portions derived from Mesen (https://github.com/nesdev-org/MesenCE):
+// the MMC2/MMC4 latch logic.
+// Mesen is Copyright (C) 2014-2026 Sour and contributors, GPL-3.0-or-later.
+
 //! Mapper 9: MMC2 (Punch-Out!!) and mapper 10: MMC4 - CHR latches flipped by the
 //! PPU fetching tiles $FD/$FE.
 
 use super::{CartBase, Mapper};
 use crate::cartridge::Mirroring;
 
+/// Nintendo MMC2 / MMC4. Each 4 KB pattern table half has two CHR bank registers and
+/// a latch that picks between them; the latch is set by the PPU itself when it fetches
+/// tile $FD or $FE from that half, letting games switch CHR mid-screen without IRQs.
+/// PRG: MMC2 has one switchable 8 KB bank at $8000 and the last three 8 KB banks
+/// fixed; MMC4 has a switchable 16 KB bank at $8000 and the last 16 KB fixed.
 #[derive(Clone)]
 pub struct Mmc2 {
+    /// Shared PRG/CHR/nametable state; CHR slots are refreshed by [`Mmc2::update_chr`].
     base: CartBase,
+    /// MMC4 (mapper 10) behaviour: 16 KB PRG banking and the wider $0FD8-$0FDF /
+    /// $0FE8-$0FEF left-latch trigger ranges.
     mmc4: bool,
+    /// Latch for PPU $0000-$0FFF: 0 after a $FD tile fetch, 1 after $FE. Indexes `left`.
     left_latch: usize,
+    /// Latch for PPU $1000-$1FFF: 0 after a $FD tile fetch, 1 after $FE. Indexes `right`.
     right_latch: usize,
+    /// 4 KB CHR banks for PPU $0000: `[0]` from $B000 (latch $FD), `[1]` from $C000
+    /// (latch $FE). 5 bits each.
     left: [u8; 2],
+    /// 4 KB CHR banks for PPU $1000: `[0]` from $D000 (latch $FD), `[1]` from $E000
+    /// (latch $FE). 5 bits each.
     right: [u8; 2],
+    /// A latch changed on the last PPU fetch. The new bank is applied on the next
+    /// address notification, because the latch flips only after the triggering
+    /// tile's pattern fetch has completed (the trigger tile itself uses the old bank).
     need_update: bool,
 }
 
 impl Mmc2 {
+    /// Sets the fixed PRG layout for MMC2 or MMC4 and starts both latches in the
+    /// $FE state with all CHR bank registers 0.
     pub fn new(mut base: CartBase, mmc4: bool) -> Self {
         if mmc4 {
             base.set_prg_16k(0, 0);
@@ -31,6 +57,7 @@ impl Mmc2 {
         m
     }
 
+    /// Maps the CHR banks currently selected by the two latches.
     fn update_chr(&mut self) {
         self.base.set_chr_4k(0, self.left[self.left_latch] as usize);
         self.base.set_chr_4k(1, self.right[self.right_latch] as usize);

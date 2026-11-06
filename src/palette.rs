@@ -1,5 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Zach Jones
+
 //! Standard 64-color Ricoh 2C02 NTSC PPU RGB palette.
 
+/// RGB for each of the 64 2C02 colour indices (a commonly used NTSC approximation).
 pub static NES_PALETTE: [[u8; 3]; 64] = [
     [84, 84, 84],
     [0, 30, 116],
@@ -86,4 +90,17 @@ pub fn apply_emphasis(rgb: [u8; 3], emphasis: u8) -> [u8; 3] {
         }
     }
     out
+}
+
+/// RGBA bytes for every (emphasis << 6 | colour) pixel value, little-endian packed.
+pub fn rgba_table() -> &'static [u32; 512] {
+    static T: std::sync::OnceLock<[u32; 512]> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mut t = [0u32; 512];
+        for (i, v) in t.iter_mut().enumerate() {
+            let rgb = apply_emphasis(NES_PALETTE[i & 0x3F], (i >> 6) as u8);
+            *v = u32::from_le_bytes([rgb[0], rgb[1], rgb[2], 255]);
+        }
+        t
+    })
 }

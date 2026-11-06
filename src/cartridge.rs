@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Zach Jones
+
 //! iNES 1.0 / NES 2.0 ROM loader, .zip archive extractor, header parser (with a
 //! CRC-keyed fixup table for known-bad headers), and battery-backed SRAM persistence.
 
@@ -7,46 +10,74 @@ use std::path::{Path, PathBuf};
 
 use flate2::read::DeflateDecoder;
 
+/// How the four logical nametables ($2000/$2400/$2800/$2C00) map onto the console's
+/// 2 KB of nametable RAM (CIRAM). Boards with mapper-controlled mirroring change this at run time.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mirroring {
+    /// All four nametables show the first 1 KB page.
     OneScreenLower,
+    /// All four nametables show the second 1 KB page.
     OneScreenUpper,
+    /// $2000=$2800, $2400=$2C00: side-by-side screens (horizontal scrolling games).
     Vertical,
+    /// $2000=$2400, $2800=$2C00: stacked screens (vertical scrolling games).
     Horizontal,
     /// Cartridge supplies 2 KB extra VRAM: four independent nametables.
     FourScreen,
 }
 
+/// A parsed ROM image: memory contents plus the board description needed to pick and
+/// configure a mapper. Produced by [`Cartridge::from_file`] / [`Cartridge::from_ines_bytes`].
 #[derive(Clone, Debug)]
 pub struct Cartridge {
+    /// Display title (file name without extension).
     pub title: String,
+    /// Where the ROM was loaded from; the `.sav` file is stored next to it.
     pub rom_path: Option<PathBuf>,
+    /// iNES / NES 2.0 mapper number (after any header fixups).
     pub mapper_id: u16,
+    /// NES 2.0 submapper (e.g. 4.1 = MMC6, 4.3 = MC-ACC, 1.5 = fixed-PRG SEROM).
     pub submapper: u8,
+    /// Program ROM (CPU $8000-$FFFF, banked by the mapper).
     pub prg_rom: Vec<u8>,
     /// CHR-ROM contents (empty when the board only has CHR-RAM).
     pub chr_rom: Vec<u8>,
+    /// Bytes of CHR-RAM on the board (0 if it only has CHR-ROM).
     pub chr_ram_size: usize,
     /// Work RAM + battery-backed save RAM, presented as one contiguous block.
     pub prg_ram: Vec<u8>,
+    /// Bytes at the start of `prg_ram` that are battery-backed.
     pub save_ram_size: usize,
+    /// Nametable mirroring at power-on (solder-pad setting for fixed-mirroring boards).
     pub initial_mirroring: Mirroring,
+    /// Whether PRG-RAM is battery-backed (saved to `<rom>.sav`).
     pub has_battery: bool,
     /// CRC32 of PRG+CHR (the usual cartridge database key).
     pub crc32: u32,
     /// Board uses the MMC3 revision A IRQ behaviour.
     pub mmc3_rev_a: bool,
+    /// The header was in NES 2.0 format.
     pub is_nes2: bool,
 }
 
+/// Correction for a ROM whose iNES header disagrees with the real cartridge hardware.
+/// `None` fields keep the header's value.
 pub struct HeaderFixup {
+    /// CRC32 of PRG-ROM + CHR-ROM (header and trainer excluded).
     pub crc: u32,
+    /// Correct mapper number.
     pub mapper: Option<u16>,
+    /// Correct submapper.
     pub submapper: Option<u8>,
+    /// Correct battery flag.
     pub battery: Option<bool>,
+    /// Correct hard-wired mirroring.
     pub mirroring: Option<Mirroring>,
+    /// Board uses an MMC3 revision A (different IRQ-at-zero behaviour).
     pub mmc3a: bool,
+    /// Battery-backed PRG-RAM size, if not 8 KB.
     pub save_ram_kb: Option<usize>,
+    /// CHR-RAM size, if not 8 KB.
     pub chr_ram_kb: Option<usize>,
 }
 
@@ -54,14 +85,23 @@ include!("cartridge_fixups.rs");
 
 /// Board info for a known headerless dump.
 pub struct HeaderlessRom {
+    /// CRC32 of the entire headerless file.
     pub crc: u32,
+    /// Mapper number.
     pub mapper: u16,
+    /// Submapper number.
     pub submapper: u8,
+    /// PRG-ROM size in KB.
     pub prg_kb: usize,
+    /// CHR-ROM size in KB (0 = CHR-RAM only).
     pub chr_kb: usize,
+    /// CHR-RAM size in KB.
     pub chr_ram_kb: usize,
+    /// PRG-RAM (work or save) size in KB.
     pub prg_ram_kb: usize,
+    /// Whether PRG-RAM is battery-backed.
     pub battery: bool,
+    /// Hard-wired nametable mirroring.
     pub mirroring: Mirroring,
 }
 
@@ -281,10 +321,12 @@ impl Cartridge {
         })
     }
 
+    /// Path of the battery save file: the ROM path with a `.sav` extension.
     pub fn sav_path(&self) -> Option<PathBuf> {
         self.rom_path.as_ref().map(|p| p.with_extension("sav"))
     }
 
+    /// Loads `<rom>.sav` into PRG-RAM if the board has a battery and the file exists.
     pub fn load_battery_sram(&mut self) {
         if !self.has_battery {
             return;
@@ -297,6 +339,7 @@ impl Cartridge {
         }
     }
 
+    /// Writes the battery-backed part of `prg_ram` to `<rom>.sav` (ignored without a battery).
     pub fn save_battery_sram(&self, prg_ram: &[u8]) {
         if !self.has_battery {
             return;
@@ -308,11 +351,13 @@ impl Cartridge {
     }
 }
 
+/// Reads a little-endian `u16` at byte offset `off` (panics if out of bounds).
 #[inline]
 fn read_u16_le(b: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([b[off], b[off + 1]])
 }
 
+/// Reads a little-endian `u32` at byte offset `off` (panics if out of bounds).
 #[inline]
 fn read_u32_le(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
@@ -405,6 +450,8 @@ pub fn extract_nes_from_zip(zip_bytes: &[u8], require_header: bool) -> Result<(V
     Err("No valid .nes ROM found inside .zip archive".to_string())
 }
 
+/// Decompresses one ZIP entry: method 0 (stored) is copied verbatim, method 8 (raw
+/// Deflate) is inflated; any other method is an error. `uncomp_size` is only a capacity hint.
 fn decompress_zip_entry(
     method: u16,
     comp_slice: &[u8],

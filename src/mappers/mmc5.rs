@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Zach Jones
+//
+// Portions derived from Mesen (https://github.com/nesdev-org/MesenCE):
+// the MMC5 scanline detection, ExRAM and split-screen logic.
+// Mesen is Copyright (C) 2014-2026 Sour and contributors, GPL-3.0-or-later.
+
 //! Mapper 5: Nintendo MMC5 (ExROM). PRG/CHR banking with separate BG/sprite CHR
 //! sets for 8x16 sprites, ExRAM (nametable / extended attributes / RAM modes),
 //! fill mode, vertical split, scanline IRQ (detected from PPU fetch patterns, as
@@ -5,49 +12,134 @@
 
 use super::{CartBase, Mapper, PrgKind, PrgSlot};
 
+/// Nintendo MMC5. The chip has no direct view of the PPU's scanline/dot position;
+/// like the real part it infers it from the PPU bus:
+///
+/// - **Scanline detection**: the PPU reads the same nametable address three times in
+///   a row only around each line boundary while rendering (the unused NT fetches at
+///   dots 337 and 339, then the dot-1 fetch of the next line, all for the same tile). On the read after such a run the
+///   chip either enters the frame (first time) or increments the scanline counter
+///   and compares it with $5203.
+/// - **In-frame**: set on the first NT fetch after a scanline start is seen; cleared
+///   when the PPU bus goes idle for 3 CPU cycles (rendering off / vblank) or when
+///   the CPU reads the NMI vector ($FFFA/$FFFB).
+/// - **CHR sets**: with 8x16 sprites, CHR set A ($5120-$5127) is used for sprite
+///   fetches (NT fetch numbers 32-47 of the line, see `split_tile_number`) and
+///   set B ($5128-$512B) for background.
+/// - **ExRAM**: 1 KB internal RAM used as an extra nametable, as per-tile extended
+///   attributes (mode 1), or as CPU RAM (modes 2/3).
+/// - **Vertical split**: replaces BG tiles left/right of a tile column with a second
+///   ExRAM-based nametable with its own vertical scroll and 4 KB CHR bank.
 #[derive(Clone)]
 pub struct Mmc5 {
+    /// Shared PRG/CHR state. Nametables are not slot-mapped here; `ppu_read` and
+    /// `ppu_write` decode them from `nt_mapping`.
     base: CartBase,
+    /// 1 KB internal ExRAM, CPU-visible at $5C00-$5FFF.
     exram: Vec<u8>,
+    /// Snooped copy of PPUCTRL ($2000); bit 5 (8x16 sprites) enables the separate
+    /// BG/sprite CHR sets.
     ppu_ctrl: u8,
+    /// $5100 PRG mode (0-3): 0 = one 32 KB bank, 1 = two 16 KB, 2 = 16 KB + two 8 KB,
+    /// 3 = four 8 KB banks. Powers up as 3.
     prg_mode: u8,
+    /// $5101 CHR mode (0-3): 8 KB, 4 KB, 2 KB or 1 KB banks.
     chr_mode: u8,
+    /// $5102 PRG-RAM protect 1 (bits 0-1); writes allowed only when this is %10.
     prg_ram_protect1: u8,
+    /// $5103 PRG-RAM protect 2 (bits 0-1); writes allowed only when this is %01.
     prg_ram_protect2: u8,
+    /// $5104 ExRAM mode (0-3): 0 = nametable, 1 = extended attributes, 2 = CPU
+    /// read/write RAM, 3 = CPU read-only RAM. In modes 0/1 CPU writes store 0 unless
+    /// in-frame, and CPU reads are open bus.
     exram_mode: u8,
+    /// $5105 nametable mapping: two bits per quadrant ($2000, $2400, $2800, $2C00 from
+    /// bit 0 up): 0 = CIRAM page 0, 1 = CIRAM page 1, 2 = ExRAM, 3 = fill mode.
     nt_mapping: u8,
+    /// $5106 fill-mode tile number, returned for every tile byte of a fill nametable.
     fill_tile: u8,
+    /// $5107 fill-mode palette (bits 0-1), replicated into all four attribute fields.
     fill_attr: u8,
+    /// $5113-$5117 PRG bank registers. `[0]` ($5113) is always an 8 KB RAM bank at
+    /// $6000; `[1]`-`[3]` select ROM (bit 7 set, bits 0-6 bank) or RAM (bit 7 clear,
+    /// bits 0-2 bank); `[4]` ($5117) is always ROM. Which ones are used, and how many
+    /// low bits are ignored, depends on `prg_mode`.
     prg_banks: [u8; 5],
+    /// $5120-$512B CHR bank registers (10-bit, upper bits from `chr_upper` at write
+    /// time). `[0]`-`[7]` = set A (sprites / everything in 8x8 mode), `[8]`-`[11]` = set B
+    /// (background in 8x16 mode).
     chr_banks: [u16; 12],
+    /// $5130 upper CHR bank bits (bits 0-1), applied to subsequent $5120-$512B writes
+    /// and to extended-attribute CHR banks.
     chr_upper: u8,
+    /// Last CHR register address written ($5120-$512B); reset to 0 by `update_chr`
+    /// while 8x8 sprites are selected. Outside
+    /// the frame it decides which set the CPU sees through $2007: A if <= $5127.
     last_chr_reg: u16,
+    /// Whether CHR set A was mapped by the last `update_chr`, so the slots are only
+    /// rewritten when the active set changes.
     prev_chr_a: bool,
+    /// $5200 bit 7: vertical split enabled.
     split_enabled: bool,
+    /// $5200 bit 6: split region is right of the delimiter (else left).
     split_right: bool,
+    /// $5200 bits 0-4: tile column (0-31) where the split region starts or ends.
     split_tile_delim: u8,
+    /// $5201 vertical scroll of the split region (0-239, wraps at 240).
     split_scroll: u8,
+    /// $5202 4 KB CHR bank used for split-region pattern fetches.
     split_bank: u8,
+    /// Whether the current BG tile fetch falls inside the split region.
     split_in_region: bool,
+    /// ExRAM nametable index (row * 32 + column) of the current split tile, reused
+    /// for its attribute fetch.
     split_tile: u32,
+    /// Index of the current NT fetch within the line, reset to 0 at the dot-1 fetch
+    /// that completes a scanline detection: 0-31 the BG tiles fetched during the line
+    /// (screen columns 2-33), 32-47 the sprite-fetch period (two garbage NT reads per
+    /// sprite), 48-49 the prefetch of the next line's columns 0-1, 50-51 the unused
+    /// fetches at dots 337/339. The split logic uses `(n + 2) % 50` as the column.
     split_tile_number: i32,
+    /// $5205 multiplier operand A.
     mul1: u8,
+    /// $5206 multiplier operand B; $5205/$5206 reads return the 16-bit product lo/hi.
     mul2: u8,
+    /// $5203 IRQ compare scanline; the IRQ is flagged when `scanline_counter` equals it.
     irq_target: u8,
+    /// $5204 bit 7: scanline IRQ enabled (gates the IRQ line, not the pending flag).
     irq_enabled: bool,
+    /// Scanline IRQ pending flag; read (and cleared) as $5204 bit 7, also cleared on
+    /// NMI-vector reads.
     irq_pending: bool,
+    /// Detected scanline number within the frame (0 on the first rendered line).
     scanline_counter: u8,
+    /// A scanline start was detected while out of frame; `in_frame` is set on the
+    /// next NT fetch.
     need_in_frame: bool,
+    /// The PPU is rendering visible lines; read back as $5204 bit 6.
     in_frame: bool,
+    /// CPU cycles left before the PPU bus is considered idle; reset to 3 on each PPU
+    /// read, and on reaching 0 the chip leaves the frame.
     ppu_idle_counter: u8,
+    /// Previous PPU read address, for detecting repeated NT reads.
     last_ppu_addr: u16,
+    /// Number of consecutive repeats of the same NT address (2 = three identical reads).
     nt_read_counter: u8,
+    /// ExRAM index (NT offset) of the last tile fetched in extended-attribute mode.
     ex_last_nt_fetch: u16,
+    /// Extended-attribute fetch counter: set to 3 on a BG NT fetch, decremented on
+    /// each following fetch. At 2 (attribute fetch) the palette comes from ExRAM bits
+    /// 6-7 and the 4 KB CHR bank from bits 0-5; at 1 and 0 (pattern low/high) the
+    /// pattern bytes are read from that bank.
     ex_fetch_counter: i8,
+    /// 4 KB CHR bank for the current extended-attribute tile: ExRAM bits 0-5 plus
+    /// `chr_upper` as bits 6-7.
     ex_chr_bank: u32,
 }
 
 impl Mmc5 {
+    /// Creates the chip in its power-on state: PRG mode 3 with $5117 = $FF (last
+    /// bank at $E000), everything else 0.
     pub fn new(base: CartBase) -> Self {
         let mut m = Self {
             base,
@@ -94,6 +186,9 @@ impl Mmc5 {
         m
     }
 
+    /// Decodes PRG bank register `reg` (index into `prg_banks`) as a full 8 KB slot:
+    /// RAM or ROM per the rules on `prg_banks`, with RAM writable only when both
+    /// protect registers hold their unlock values.
     fn bank_slot(&self, reg: usize) -> PrgSlot {
         let raw = self.prg_banks[reg];
         let is_ram = reg == 0 || (raw & 0x80 == 0 && reg != 4);
@@ -110,6 +205,9 @@ impl Mmc5 {
         }
     }
 
+    /// Maps CPU `slot` (1-4 = $8000-$E000) from register `reg`, for 16/32 KB modes:
+    /// the bank is `(reg & bank_mask) | sub`, where `sub` picks the 8 KB piece of a
+    /// larger bank. ROM/RAM selection and writability come from [`Mmc5::bank_slot`].
     fn set_slot(&mut self, slot: usize, reg: usize, bank_mask: u8, sub: u8) {
         let mut s = self.bank_slot(reg);
         let raw = self.prg_banks[reg];
@@ -122,6 +220,7 @@ impl Mmc5 {
         self.base.prg[slot] = s;
     }
 
+    /// Remaps $6000 (always `prg_banks[0]`) and $8000-$FFFF according to `prg_mode`.
     fn update_prg(&mut self) {
         self.base.prg[0] = self.bank_slot(0);
         match self.prg_mode {
@@ -151,6 +250,10 @@ impl Mmc5 {
         }
     }
 
+    /// Maps CHR set A or B into the eight 1 KB slots according to `chr_mode`. Set A
+    /// is used in 8x8 sprite mode, during sprite fetches (tiles 32-47), and outside
+    /// the frame when the last-written CHR register was in set A; otherwise set B.
+    /// Unless `force`, does nothing when the active set has not changed.
     fn update_chr(&mut self, force: bool) {
         let large = self.ppu_ctrl & 0x20 != 0;
         if !large {
@@ -197,6 +300,8 @@ impl Mmc5 {
         }
     }
 
+    /// Reads CHR memory (ROM if present, else RAM) at absolute byte `pos`, wrapping
+    /// to its size. Used for ExRAM-attribute and split fetches, which bypass the slots.
     fn read_chr_raw(&self, pos: usize) -> u8 {
         if !self.base.chr_rom.is_empty() {
             self.base.chr_rom[pos % self.base.chr_rom.len()]
@@ -205,6 +310,8 @@ impl Mmc5 {
         }
     }
 
+    /// Reads PPU $2000-$2FFF through the $5105 mapping: CIRAM page 0/1, ExRAM (0 if
+    /// ExRAM is in a CPU-RAM mode), or the fill tile / fill attribute.
     fn read_nametable(&self, addr: u16) -> u8 {
         let quadrant = ((addr >> 10) & 3) as usize;
         let off = (addr & 0x3FF) as usize;
@@ -228,6 +335,11 @@ impl Mmc5 {
         }
     }
 
+    /// Scanline detector, run on every PPU read. Counts consecutive identical NT
+    /// address reads; once two repeats (three identical reads) have been seen, the
+    /// next read with a different address marks a new scanline: enter the frame
+    /// (via `need_in_frame`) or advance `scanline_counter` and flag the IRQ on a
+    /// match with $5203. Also resets `split_tile_number` at the line start.
     fn detect_scanline_start(&mut self, addr: u16) {
         if self.nt_read_counter >= 2 {
             if !self.in_frame && !self.need_in_frame {
@@ -250,6 +362,7 @@ impl Mmc5 {
         }
     }
 
+    /// Leaves the in-frame state and remaps CHR (the active set may change).
     fn leave_frame(&mut self) {
         self.in_frame = false;
         self.update_chr(true);
@@ -351,11 +464,16 @@ impl Mapper for Mmc5 {
     }
 
     fn ppu_register_write(&mut self, addr: u16, val: u8) {
+        // Only $2000 matters (sprite size). Leaving the frame when rendering is disabled via
+        // $2001 is detected the way the real chip does it: the PPU stops reading, and the
+        // idle counter in `cpu_clock` expires after 3 CPU cycles.
         if addr & 7 == 0 {
             self.ppu_ctrl = val;
-        } else if addr & 7 == 1 && val & 0x18 == 0 {
-            // Rendering disabled: the PPU stops fetching, so in-frame drops.
         }
+    }
+
+    fn wants_cpu_clock(&self) -> bool {
+        true
     }
 
     fn cpu_clock(&mut self) {

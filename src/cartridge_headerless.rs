@@ -1,4 +1,14 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Zach Jones
+//
+// Portions derived from Mesen (https://github.com/nesdev-org/MesenCE):
+// cartridge data from the Mesen game database.
+// Mesen is Copyright (C) 2014-2026 Sour and contributors, GPL-3.0-or-later.
+// (Mesen's database is itself compiled from NesCartDB, Nestopia's database and
+// NewRisingSun's NES 2.0 header database.)
+
 // Board descriptions for headerless (raw PRG+CHR) dumps in the local library, keyed by CRC32.
+/// Known headerless dumps, matched by [`HeaderlessRom::crc`] of the whole file.
 pub static HEADERLESS_ROMS: &[HeaderlessRom] = &[
     HeaderlessRom { crc: 0x063E5653, mapper: 1, submapper: 0, prg_kb: 128, chr_kb: 128, chr_ram_kb: 0, prg_ram_kb: 0, battery: false, mirroring: Mirroring::Horizontal }, // Addams Family, The - Pugsley's Scavenger Hunt (USA)
     HeaderlessRom { crc: 0x71BF075F, mapper: 1, submapper: 5, prg_kb: 32, chr_kb: 32, chr_ram_kb: 0, prg_ram_kb: 0, battery: false, mirroring: Mirroring::Horizontal }, // Adventures of Lolo (USA)

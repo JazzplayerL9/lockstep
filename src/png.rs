@@ -1,7 +1,11 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Zach Jones
+
 //! Minimal RGBA PNG encoder (used for screenshots by the headless runner).
 
 use std::io::Write;
 
+/// CRC-32 (IEEE, as required by PNG) over the concatenation of `chunks`.
 fn crc32(chunks: &[&[u8]]) -> u32 {
     let mut c = flate2::Crc::new();
     for ch in chunks {
@@ -10,6 +14,8 @@ fn crc32(chunks: &[&[u8]]) -> u32 {
     c.sum()
 }
 
+/// Appends one PNG chunk to `out`: big-endian length, 4-byte type, data, and the CRC-32
+/// of type + data.
 fn write_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
     out.extend_from_slice(&(data.len() as u32).to_be_bytes());
     out.extend_from_slice(kind);

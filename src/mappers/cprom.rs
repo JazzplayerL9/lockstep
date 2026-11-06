@@ -1,14 +1,23 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Zach Jones
+
 //! Mapper 13: CPROM (Videomation) - 16 KB CHR-RAM, upper 4 KB switchable.
 
 use super::{CartBase, Mapper};
 use crate::cartridge::Mirroring;
 
+/// CPROM board: fixed 32 KB PRG-ROM, 16 KB CHR-RAM. PPU $0000-$0FFF is always CHR-RAM
+/// page 0; a latch at $8000-$FFFF (bits 0-1, subject to bus conflicts) selects which
+/// 4 KB page appears at PPU $1000-$1FFF. Mirroring is fixed vertical.
 #[derive(Clone)]
 pub struct CpRom {
+    /// Shared PRG/CHR/nametable state; CHR slot 1 ($1000) is rewritten on each latch write.
     base: CartBase,
 }
 
 impl CpRom {
+    /// Ensures at least 16 KB of CHR-RAM (some dumps under-declare it), maps PRG bank 0,
+    /// CHR page 0 in both 4 KB halves and vertical mirroring.
     pub fn new(mut base: CartBase) -> Self {
         if base.chr_ram.len() < 0x4000 {
             base.chr_ram = vec![0; 0x4000];

@@ -117,9 +117,9 @@ compatibility test above, except where noted.
 - **PAL and Dendy consoles are not supported** (NTSC timing only).
 
 **APU / audio**
-- Cartridge expansion audio (MMC5 pulse + PCM, Sunsoft 5B, VRC6/VRC7, Namco 163, FDS) is
-  not emulated. North-American consoles don't route cartridge audio without
-  modification, so US games don't rely on it.
+- **MMC5** (two expansion pulse channels + 8-bit PCM DAC) and **Sunsoft 5B / FME-7**
+  (3-channel YM2149F tone + noise PSG) expansion audio are emulated and mixed into the
+  2A03 output stage. VRC6/VRC7, Namco 163, and FDS expansion audio are not emulated.
 - The frame-IRQ flag is cleared immediately on a `$4015` read, rather than at the next
   APU cycle.
 - DMC "sample duplication" glitches of later CPU revisions are not modelled.

@@ -77,10 +77,7 @@ fn poll_joypad_buttons() -> u8 {
     if is_key_down(KeyCode::X) || is_key_down(KeyCode::K) || is_key_down(KeyCode::LeftShift) {
         mask |= BTN_B;
     }
-    if is_key_down(KeyCode::RightShift)
-        || is_key_down(KeyCode::Tab)
-        || is_key_down(KeyCode::Backspace)
-    {
+    if is_key_down(KeyCode::RightShift) || is_key_down(KeyCode::Tab) {
         mask |= BTN_SELECT;
     }
     if is_key_down(KeyCode::Enter) {
@@ -115,10 +112,7 @@ fn poll_joypad_pressed() -> u8 {
     {
         mask |= BTN_B;
     }
-    if is_key_pressed(KeyCode::RightShift)
-        || is_key_pressed(KeyCode::Tab)
-        || is_key_pressed(KeyCode::Backspace)
-    {
+    if is_key_pressed(KeyCode::RightShift) || is_key_pressed(KeyCode::Tab) {
         mask |= BTN_SELECT;
     }
     if is_key_pressed(KeyCode::Enter) {
@@ -349,10 +343,11 @@ KEYS & GAMEPADS:
     Arrows / WASD   D-pad          Z / J / Space   A
     X / K / LShift  B              Enter           Start
     RShift / Tab    Select         R               Reset
-    1 - 9           Select save-state slot (1-9, persisted as <rom>.s1..<rom>.s9)
+    Backspace       Rewind (hold)  ` / ~           Fast-forward (hold)
+    P / .           Pause / Step   1 - 9           Select save-state slot (1-9)
     Mouse L / R     Zapper light-gun aim + fire / off-screen shot (Port 2)
     Esc / F1  ROM browser   F2 Unload   F3 RT scheduling   F4 Overclock
-    F5 / F8   Save / load state   F6 Overscan crop   F7 Run-ahead   F9 Pad A/B swap   F11 Fullscreen
+    F5 / F8   Save / load   F6 Crop     F7 Run-ahead       F9 Pad A/B   F10 CRT/4:3   F11 Fullscreen
 
 See README.md and docs/ for details.";
 
@@ -439,6 +434,8 @@ async fn run() {
     let mut fullscreen = false;
     let mut state_slot: u8 = 1;
     let mut zapper_reticle_timer = 0.0f64;
+    // Display filter mode (0 = Sharp 8:7 pixel-exact, 1 = NTSC 4:3, 2 = CRT Scanlines 4:3).
+    let mut display_filter: u8 = if env::var_os("LOCKSTEP_CRT").is_some() { 2 } else { 0 };
 
     loop {
         let now = get_time();
@@ -545,6 +542,16 @@ async fn run() {
             toast_timer = 2.5;
         }
 
+        if is_key_pressed(KeyCode::F10) {
+            display_filter = (display_filter + 1) % 3;
+            toast_text = match display_filter {
+                0 => "Display: Sharp 8:7 (Pixel-Exact)".to_string(),
+                1 => "Display: NTSC 4:3 Aspect Ratio".to_string(),
+                _ => "Display: CRT Scanlines + NTSC 4:3".to_string(),
+            };
+            toast_timer = 2.5;
+        }
+
         if is_key_pressed(KeyCode::F7) {
             let next = (shared.run_ahead.load(Ordering::Acquire) + 1) % 3;
             let _ = cmd_tx.send(EmulatorCommand::SetRunAhead(next));
@@ -569,6 +576,8 @@ async fn run() {
         if show_browser {
             // Pause keyboard input to the game while browsing files
             shared.update_input(0, 0);
+            shared.rewind_active.store(false, Ordering::Release);
+            shared.fast_forward.store(false, Ordering::Release);
 
             let n = browser.entries.len();
             let up_down = is_key_down(KeyCode::Up) || (pad_held & BTN_UP != 0);
@@ -639,6 +648,25 @@ async fn run() {
                 toast_text = "NES Reset".to_string();
                 toast_timer = 1.5;
             }
+            if is_key_pressed(KeyCode::P) && shared.rom_loaded.load(Ordering::Acquire) {
+                let next_p = !shared.paused.load(Ordering::Acquire);
+                shared.paused.store(next_p, Ordering::Release);
+                toast_text = if next_p { "Emulation Paused (press . to step frame)".to_string() } else { "Emulation Resumed".to_string() };
+                toast_timer = 2.0;
+            }
+            if is_key_pressed(KeyCode::Period) && shared.rom_loaded.load(Ordering::Acquire) {
+                shared.paused.store(true, Ordering::Release);
+                let _ = shared
+                    .step_frames
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some(v.saturating_add(1)));
+            }
+            let rew = is_key_down(KeyCode::Backspace)
+                || ((pad_held & BTN_SELECT != 0) && pad_page_up);
+            let ff = is_key_down(KeyCode::GraveAccent)
+                || ((pad_held & BTN_SELECT != 0) && pad_page_down);
+            shared.rewind_active.store(rew, Ordering::Release);
+            shared.fast_forward.store(ff && !rew, Ordering::Release);
+
             let held = poll_joypad_buttons();
             let pressed = poll_joypad_pressed();
             shared.update_input(held, pressed);
@@ -669,7 +697,8 @@ async fn run() {
                 SCREEN_WIDTH as f32 - 2.0 * crop,
                 SCREEN_HEIGHT as f32 - 2.0 * crop,
             );
-            let aspect = src.w / src.h;
+            let par = if display_filter >= 1 { 8.0 / 7.0 } else { 1.0 };
+            let aspect = (src.w * par) / src.h;
             let (draw_w, draw_h) = if sw / sh > aspect {
                 (sh * aspect, sh)
             } else {
@@ -689,6 +718,48 @@ async fn run() {
                     ..Default::default()
                 },
             );
+
+            // CRT scanline & phosphor aperture overlay when `display_filter == 2`.
+            if display_filter == 2 {
+                let scanlines = src.h as usize;
+                let line_step = draw_h / (scanlines as f32);
+                if line_step >= 2.0 {
+                    let bar_h = (line_step * 0.34).clamp(1.0, 3.0);
+                    let scan_col = Color::new(0.0, 0.0, 0.0, 0.36);
+                    for i in 0..scanlines {
+                        let y = draw_y + (i as f32 + 0.66) * line_step;
+                        draw_rectangle(draw_x, y, draw_w, bar_h, scan_col);
+                    }
+                }
+                // Subtle CRT bezel frame around the 4:3 tube area.
+                draw_rectangle_lines(
+                    draw_x - 1.0,
+                    draw_y - 1.0,
+                    draw_w + 2.0,
+                    draw_h + 2.0,
+                    2.0,
+                    Color::new(0.18, 0.20, 0.25, 0.85),
+                );
+            }
+
+            if !show_browser {
+                let badge = if shared.rewind_active.load(Ordering::Acquire) {
+                    Some(("<< REWIND", Color::new(0.95, 0.65, 0.20, 0.90)))
+                } else if shared.fast_forward.load(Ordering::Acquire) {
+                    Some((">> FAST-FWD 2x", Color::new(0.35, 0.85, 0.55, 0.90)))
+                } else if shared.paused.load(Ordering::Acquire) {
+                    Some(("|| PAUSED", Color::new(0.90, 0.85, 0.35, 0.90)))
+                } else {
+                    None
+                };
+                if let Some((label, col)) = badge {
+                    let tw = measure_text(label, None, 18, 1.0).width;
+                    let bx = draw_x + draw_w - tw - 24.0;
+                    let by = draw_y + 14.0;
+                    draw_rectangle(bx - 8.0, by, tw + 16.0, 26.0, Color::new(0.05, 0.07, 0.12, 0.80));
+                    draw_text(label, bx, by + 19.0, 18.0, col);
+                }
+            }
 
             if !show_browser {
                 let (mx, my) = mouse_position();
@@ -870,7 +941,7 @@ async fn run() {
                 help,
             );
             draw_text(
-                &fit_text("Esc/F1: Game  F2: Unload  F3: RT  F4: Overclock  1-9: Slot  F5/F8: Save/Load  F6: Crop  F7: Run-ahead  F9: Pad A/B  F11: Full", text_w, 15),
+                &fit_text("Esc/F1: Game  F2: Unload  F3: RT  F4: OC  1-9: Slot  F5/F8: State  F6: Crop  F7: Run-ahead  F9: A/B  F10: CRT  Bksp: Rewind  P/.: Pause", text_w, 15),
                 panel_x + 18.0,
                 footer_y,
                 15.0,

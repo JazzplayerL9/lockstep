@@ -1495,4 +1495,45 @@ mod tests {
         assert_eq!(v_on & 0x08, 0x00);
         assert_eq!(v_on & 0x10, 0x10);
     }
+
+    #[test]
+    fn mmc5_and_sunsoft_5b_expansion_audio_produce_samples() {
+        // 1. MMC5 (mapper 5): enable Pulse 1 ($5015 = 1), constant volume 15 ($5000 = 0xDF), period 100 ($5002/$5003), and PCM = 0x80 ($5011).
+        let mut rom5 = make_test_rom(&[0x4C, 0x00, 0x80]);
+        rom5[6] = 0x50; // Mapper 5
+        let cart5 = Cartridge::from_ines_bytes(&rom5, "MMC5 Audio Test".into()).unwrap();
+        let mut sys5 = System::new(cart5).unwrap();
+        assert!(sys5.mapper.has_expansion_audio());
+        sys5.bus_write(0x5015, 0x01);
+        sys5.bus_write(0x5000, 0xDF);
+        sys5.bus_write(0x5002, 100);
+        sys5.bus_write(0x5003, 0x08);
+        sys5.bus_write(0x5011, 0x80);
+        assert_eq!(sys5.bus_read(0x5015) & 1, 1);
+        sys5.run_frame();
+        assert!(sys5.mapper.audio_sample() < -0.05);
+
+        // 2. Sunsoft 5B / FME-7 (mapper 69): enable Tone A ($C000=7, $E000=0x3E), period 64 ($C000=0, $E000=64), volume 15 ($C000=8, $E000=15).
+        let mut rom69 = make_test_rom(&[0x4C, 0x00, 0x80]);
+        rom69[6] = (69 & 0x0F) << 4;
+        rom69[7] = 69 & 0xF0;
+        let cart69 = Cartridge::from_ines_bytes(&rom69, "5B Audio Test".into()).unwrap();
+        let mut sys69 = System::new(cart69).unwrap();
+        assert!(sys69.mapper.has_expansion_audio());
+        sys69.bus_write(0xC000, 7);
+        sys69.bus_write(0xE000, 0x3E);
+        sys69.bus_write(0xC000, 0);
+        sys69.bus_write(0xE000, 64);
+        sys69.bus_write(0xC000, 8);
+        sys69.bus_write(0xE000, 15);
+        let mut saw_nonzero = false;
+        for _ in 0..500 {
+            sys69.mapper.cpu_clock();
+            if sys69.mapper.audio_sample() < -0.01 {
+                saw_nonzero = true;
+                break;
+            }
+        }
+        assert!(saw_nonzero);
+    }
 }

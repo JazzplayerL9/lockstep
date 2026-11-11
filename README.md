@@ -36,8 +36,10 @@ lockstep "Super Mario Bros. 3 (USA).zip"
 - **Dot-based 2C02 PPU**: the real background fetch pipeline and shift registers, cycle-exact
   sprite evaluation (including the overflow bug), sprite pattern fetches on dots 257-320,
   delayed `$2006`/`$2007` effects, the odd-frame dot skip, VBlank/NMI races, and open-bus decay.
-- **APU**: exact frame-counter and `$4017` timing, length-counter reload quirks, and DMC
-  sample fetches performed as real DMA that steals CPU cycles and interacts with OAM DMA.
+- **APU & expansion audio**: exact frame-counter and `$4017` timing, length-counter reload
+  quirks, DMC sample fetches performed as real DMA that steals CPU cycles and interacts with OAM
+  DMA, plus **MMC5** (2 pulse channels + 8-bit PCM) and **Sunsoft 5B / FME-7** (3-channel YM2149F
+  PSG + noise) cartridge expansion audio.
 - **Mappers**: NROM, MMC1 (incl. SUROM / SEROM / NES-EVENT), UxROM, CNROM, MMC3 (incl. MMC6,
   MC-ACC, TxSROM, TQROM, rev A), MMC5, AxROM, MMC2, MMC4, Color Dreams, CPROM, BNROM /
   NINA-001, NES-QJ, GxROM, FME-7, Camerica, NINA-03/06, Namco 108. See
@@ -74,8 +76,10 @@ lockstep "Super Mario Bros. 3 (USA).zip"
 - Loads `.nes`, NES 2.0 headers, `.zip` archives, and known **headerless** dumps.
 - Corrects known-bad iNES headers by CRC (wrong mapper, mirroring or battery flags).
 - Battery saves (`<rom>.sav`, written every ~10 s and on exit), **9 persistent disk save-state
-  slots** (`<rom>.s1`..`<rom>.s9`, gzip-compressed), reset.
-- ROM browser with hold-to-scroll, overscan crop, fullscreen, optional "overclock".
+  slots** (`<rom>.s1`..`<rom>.s9`, gzip-compressed), **real-time Rewind** (hold `Backspace`),
+  **Pause / single-frame step** (`P` / `.`), **2x Fast-Forward** (hold `` ` `` / `~`), reset.
+- ROM browser with hold-to-scroll, overscan crop, **CRT scanline + NTSC 4:3 aspect-ratio filter**
+  (F10), fullscreen, optional "overclock".
 - **Cross-platform (Linux & Windows)**: full real-time `PREEMPT_RT` / `SCHED_FIFO` support on
   Linux; runs natively on Windows with `QueryPerformanceCounter` timing, 1 ms multimedia timer
   periods (`timeBeginPeriod(1)`), high thread priority, WASAPI audio, and XInput gamepads.
@@ -159,7 +163,8 @@ keyboard and the first gamepad; a second gamepad drives Player 2.
 | A | Z, J or Space | South (A / Cross), North (Y / Triangle), R1 or R2 |
 | B | X, K or Left Shift | West (X / Square), East (B / Circle), L1 or L2 |
 | Start | Enter | Start |
-| Select | Right Shift, Tab or Backspace | Select / Back |
+| Select | Right Shift or Tab | Select / Back |
+| Rewind / Fast-Forward | Hold `Backspace` / Hold `` ` `` | Select + L1 / Select + R1 |
 | ROM Browser | Esc or F1 | Guide / Mode button, or Select + Start |
 
 Set `LOCKSTEP_PAD_SWAP=1` if you prefer Nintendo face-button labels (`East` = A, `South` = B).
@@ -185,7 +190,11 @@ detection on `$4017` bit 3), and **right-click** pulls the trigger aimed off-scr
 | F6 | Toggle 8-pixel overscan crop |
 | F7 | Cycle run-ahead: off → 1 frame → 2 frames |
 | F9 | Toggle gamepad A/B button layout swap (`South=A` vs `East=A`) |
+| F10 | Cycle display filter: Sharp 8:7 → NTSC 4:3 → CRT Scanlines 4:3 |
 | F11 | Toggle fullscreen |
+| P / . | Pause emulation / Step 1 frame forward |
+| Backspace (hold) | Real-time rewind (~10 s ring buffer) |
+| `` ` `` / `~` (hold) | 2x fast-forward |
 | R | Reset the console |
 
 ---

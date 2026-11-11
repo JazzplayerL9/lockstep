@@ -8,9 +8,122 @@
 //! Mapper 5: Nintendo MMC5 (ExROM). PRG/CHR banking with separate BG/sprite CHR
 //! sets for 8x16 sprites, ExRAM (nametable / extended attributes / RAM modes),
 //! fill mode, vertical split, scanline IRQ (detected from PPU fetch patterns, as
-//! on hardware) and the 8x8 multiplier. Expansion audio is not emulated.
+//! on hardware), the 8x8 multiplier, and MMC5 expansion audio (two pulse channels
+//! plus 8-bit PCM).
 
 use super::{CartBase, Mapper, PrgKind, PrgSlot};
+
+/// Length-counter lookup table (identical to the 2A03 APU).
+const MMC5_LC_TABLE: [u8; 32] = [
+    10, 254, 20, 2, 40, 4, 80, 6, 160, 8, 60, 10, 14, 12, 26, 14,
+    12, 16, 24, 18, 48, 20, 96, 22, 192, 24, 72, 26, 16, 28, 32, 30,
+];
+
+/// Duty sequences for the two MMC5 pulse channels.
+const MMC5_DUTY_TABLE: [[u8; 8]; 4] = [
+    [0, 0, 0, 0, 0, 0, 0, 1],
+    [0, 0, 0, 0, 0, 0, 1, 1],
+    [0, 0, 0, 0, 1, 1, 1, 1],
+    [1, 1, 1, 1, 1, 1, 0, 0],
+];
+
+/// One MMC5 expansion pulse channel ($5000-$5003 or $5004-$5007; no sweep unit).
+#[derive(Clone, Copy, Default)]
+struct Mmc5Pulse {
+    /// Channel enabled via $5015.
+    enabled: bool,
+    /// Duty cycle selector (0-3).
+    duty: u8,
+    /// Duty sequencer step (0-7).
+    duty_pos: u8,
+    /// Envelope loop / length-counter halt flag ($5000/$5004 bit 5).
+    halt: bool,
+    /// Constant volume flag ($5000/$5004 bit 4).
+    constant_vol: bool,
+    /// Volume / envelope period ($5000/$5004 bits 0-3).
+    volume: u8,
+    /// Envelope start flag (set on $5003/$5007 write).
+    env_start: bool,
+    /// Envelope divider countdown.
+    env_divider: i8,
+    /// Envelope decay level (0-15).
+    env_counter: u8,
+    /// Length counter.
+    lc: u8,
+    /// 11-bit timer period.
+    period: u16,
+    /// Timer countdown in CPU cycles (`period * 2 + 1`).
+    timer: u16,
+}
+
+impl Mmc5Pulse {
+    /// Handles a write to one of the channel's four registers.
+    fn write(&mut self, reg: u16, val: u8) {
+        match reg & 3 {
+            0 => {
+                self.duty = val >> 6;
+                self.halt = val & 0x20 != 0;
+                self.constant_vol = val & 0x10 != 0;
+                self.volume = val & 0x0F;
+            }
+            2 => {
+                self.period = (self.period & 0x0700) | val as u16;
+            }
+            3 => {
+                self.period = (self.period & 0x00FF) | (((val & 7) as u16) << 8);
+                if self.enabled {
+                    self.lc = MMC5_LC_TABLE[(val >> 3) as usize];
+                }
+                self.duty_pos = 0;
+                self.env_start = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// 240 Hz frame clock: advances both the envelope and the length counter.
+    fn clock_240hz(&mut self) {
+        if !self.env_start {
+            self.env_divider -= 1;
+            if self.env_divider < 0 {
+                self.env_divider = self.volume as i8;
+                if self.env_counter > 0 {
+                    self.env_counter -= 1;
+                } else if self.halt {
+                    self.env_counter = 15;
+                }
+            }
+        } else {
+            self.env_start = false;
+            self.env_counter = 15;
+            self.env_divider = self.volume as i8;
+        }
+        if !self.halt && self.lc > 0 {
+            self.lc -= 1;
+        }
+    }
+
+    /// Advances the timer by one CPU cycle.
+    #[inline]
+    fn clock_cpu(&mut self) {
+        if self.timer == 0 {
+            self.timer = self.period * 2 + 1;
+            self.duty_pos = self.duty_pos.wrapping_sub(1) & 7;
+        } else {
+            self.timer -= 1;
+        }
+    }
+
+    /// Current channel output (0-15). Unlike the 2A03, periods below 8 are not muted.
+    #[inline]
+    fn output(&self) -> u8 {
+        if self.lc == 0 {
+            return 0;
+        }
+        let env = if self.constant_vol { self.volume } else { self.env_counter };
+        MMC5_DUTY_TABLE[self.duty as usize][self.duty_pos as usize] * env
+    }
+}
 
 /// Nintendo MMC5. The chip has no direct view of the PPU's scanline/dot position;
 /// like the real part it infers it from the PPU bus:
@@ -135,6 +248,20 @@ pub struct Mmc5 {
     /// 4 KB CHR bank for the current extended-attribute tile: ExRAM bits 0-5 plus
     /// `chr_upper` as bits 6-7.
     ex_chr_bank: u32,
+    /// MMC5 expansion Pulse 1 ($5000-$5003).
+    pulse1: Mmc5Pulse,
+    /// MMC5 expansion Pulse 2 ($5004-$5007).
+    pulse2: Mmc5Pulse,
+    /// Divider counting down from 7457 CPU cycles for the 240 Hz MMC5 audio frame tick.
+    audio_timer: u16,
+    /// $5010 bit 0: PCM read mode (`true` = snoop reads at $8000-$BFFF into `pcm_output`).
+    pcm_read_mode: bool,
+    /// $5010 bit 7: PCM IRQ enabled.
+    pcm_irq_enabled: bool,
+    /// PCM IRQ pending flag (set when 0 is loaded into the PCM channel).
+    pcm_irq_pending: bool,
+    /// Current 8-bit PCM DAC level ($5011).
+    pcm_output: u8,
 }
 
 impl Mmc5 {
@@ -180,6 +307,13 @@ impl Mmc5 {
             ex_last_nt_fetch: 0,
             ex_fetch_counter: 0,
             ex_chr_bank: 0,
+            pulse1: Mmc5Pulse::default(),
+            pulse2: Mmc5Pulse::default(),
+            audio_timer: 7457,
+            pcm_read_mode: false,
+            pcm_irq_enabled: false,
+            pcm_irq_pending: false,
+            pcm_output: 0,
         };
         m.update_prg();
         m.update_chr(true);
@@ -383,7 +517,15 @@ impl Mapper for Mmc5 {
             }
             0x5205 => Some(((self.mul1 as u16 * self.mul2 as u16) & 0xFF) as u8),
             0x5206 => Some(((self.mul1 as u16 * self.mul2 as u16) >> 8) as u8),
-            0x5015 => Some(0),
+            0x5010 => {
+                let v = (if self.pcm_irq_pending && self.pcm_irq_enabled { 0x80 } else { 0 })
+                    | (self.pcm_read_mode as u8);
+                self.pcm_irq_pending = false;
+                Some(v)
+            }
+            0x5015 => {
+                Some((if self.pulse1.lc > 0 { 1 } else { 0 }) | (if self.pulse2.lc > 0 { 2 } else { 0 }))
+            }
             0x5C00..=0x5FFF => {
                 if self.exram_mode >= 2 {
                     Some(self.exram[(addr - 0x5C00) as usize])
@@ -398,6 +540,19 @@ impl Mapper for Mmc5 {
                 self.irq_pending = false;
                 self.base.read_prg(addr)
             }
+            0x8000..=0xBFFF => {
+                let v = self.base.read_prg(addr);
+                if self.pcm_read_mode
+                    && let Some(b) = v
+                {
+                    if b == 0 {
+                        self.pcm_irq_pending = true;
+                    } else {
+                        self.pcm_output = b;
+                    }
+                }
+                v
+            }
             0x6000..=0xFFFF => self.base.read_prg(addr),
             _ => None,
         }
@@ -405,6 +560,31 @@ impl Mapper for Mmc5 {
 
     fn cpu_write(&mut self, addr: u16, val: u8, _cycle: u64) {
         match addr {
+            0x5000..=0x5003 => self.pulse1.write(addr, val),
+            0x5004..=0x5007 => self.pulse2.write(addr, val),
+            0x5010 => {
+                self.pcm_read_mode = val & 0x01 != 0;
+                self.pcm_irq_enabled = val & 0x80 != 0;
+            }
+            0x5011 => {
+                if !self.pcm_read_mode {
+                    if val == 0 {
+                        self.pcm_irq_pending = true;
+                    } else {
+                        self.pcm_output = val;
+                    }
+                }
+            }
+            0x5015 => {
+                self.pulse1.enabled = val & 0x01 != 0;
+                if !self.pulse1.enabled {
+                    self.pulse1.lc = 0;
+                }
+                self.pulse2.enabled = val & 0x02 != 0;
+                if !self.pulse2.enabled {
+                    self.pulse2.lc = 0;
+                }
+            }
             0x5100 => {
                 self.prg_mode = val & 3;
                 self.update_prg();
@@ -483,6 +663,24 @@ impl Mapper for Mmc5 {
                 self.leave_frame();
             }
         }
+        self.pulse1.clock_cpu();
+        self.pulse2.clock_cpu();
+        if self.audio_timer == 0 {
+            self.audio_timer = 7457;
+            self.pulse1.clock_240hz();
+            self.pulse2.clock_240hz();
+        } else {
+            self.audio_timer -= 1;
+        }
+    }
+
+    fn has_expansion_audio(&self) -> bool {
+        true
+    }
+
+    fn audio_sample(&self) -> f32 {
+        let p = (self.pulse1.output() + self.pulse2.output()) as f32;
+        -0.00752 * p - 0.00085 * (self.pcm_output as f32)
     }
 
     fn ppu_read(&mut self, addr: u16) -> u8 {
@@ -576,6 +774,6 @@ impl Mapper for Mmc5 {
     }
 
     fn irq(&self) -> bool {
-        self.irq_pending && self.irq_enabled
+        (self.irq_pending && self.irq_enabled) || (self.pcm_irq_pending && self.pcm_irq_enabled)
     }
 }

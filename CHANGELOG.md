@@ -27,6 +27,13 @@ The project was renamed from `nes-rt-emu` to **Lockstep** and licensed under the
 - **NES Zapper light-gun emulation** (`$4017` bits 3 and 4): mouse cursor aim + left/right click
   trigger with dot-accurate CRT beam and phosphor-persistence luminance sensing (*Duck Hunt*,
   *Wild Gunman*, *Hogan's Alley*, *Gumshoe*, etc.).
+- **Real-time Rewind, Pause, Frame-Advance & Fast-Forward**: hold `Backspace` (or `Select + L1`)
+  to rewind up to 10 seconds of gameplay; press `P` to pause and `.` to advance frame-by-frame;
+  hold `` ` `` / `~` (or `Select + R1`) for 2x fast-forward.
+- **CRT Scanline & NTSC 4:3 Display Filter** (`F10`, or `LOCKSTEP_CRT=1`): cycles between pixel-exact
+  8:7, NTSC 4:3 pixel aspect ratio (`8:7` PAR), and CRT scanline + bezel mode.
+- **Expansion Audio**: implemented **MMC5** (two expansion pulse channels + 8-bit PCM DAC and IRQ)
+  and **Sunsoft 5B / FME-7** (3-channel YM2149F tone + noise PSG with logarithmic DAC).
 - **Windows support**: portable monotonic nanosecond clock (`QueryPerformanceCounter` via
   `std::time::Instant`), 1 ms multimedia timer period (`timeBeginPeriod(1)`), high-priority
   emulation (`THREAD_PRIORITY_HIGHEST`) and audio (`THREAD_PRIORITY_TIME_CRITICAL`) threads,

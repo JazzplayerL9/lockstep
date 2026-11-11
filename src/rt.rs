@@ -455,6 +455,14 @@ pub struct RtSharedState {
     pub zapper_y: AtomicI32,
     /// Latched Zapper trigger frames (`> 0` when the trigger was pulled since the last frame).
     pub zapper_trigger: AtomicU8,
+    /// Emulation paused (`P` key).
+    pub paused: AtomicBool,
+    /// Single-frame step counter (`.` key while paused): worker runs one frame per count.
+    pub step_frames: AtomicU8,
+    /// Fast-forward active (`` ` `` / `~` held or `F10` toggled).
+    pub fast_forward: AtomicBool,
+    /// Real-time rewind active (`Backspace` held during gameplay).
+    pub rewind_active: AtomicBool,
     /// Latest human-readable gamepad status summary from the 1000 Hz poller thread.
     pub pad_status: Mutex<String>,
     /// Toast messages queued by worker/input threads for display on the HUD.
@@ -520,6 +528,10 @@ impl RtSharedState {
             zapper_x: AtomicI32::new(-1),
             zapper_y: AtomicI32::new(-1),
             zapper_trigger: AtomicU8::new(0),
+            paused: AtomicBool::new(false),
+            step_frames: AtomicU8::new(0),
+            fast_forward: AtomicBool::new(false),
+            rewind_active: AtomicBool::new(false),
             pad_status: Mutex::new("No gamepad connected (plug-and-play ready)".to_string()),
             toasts: Mutex::new(Vec::new()),
             running: AtomicBool::new(true),
@@ -802,6 +814,8 @@ fn worker_main(shared: Arc<RtSharedState>, cmd_rx: Receiver<EmulatorCommand>) {
 
     let mut sys: Option<Box<System>> = None;
     let mut saved: [Option<Box<System>>; 9] = Default::default();
+    let mut rewind_ring: std::collections::VecDeque<Box<System>> =
+        std::collections::VecDeque::with_capacity(300);
     let mut overclock = shared.overclock_enabled.load(Ordering::Acquire);
     let mut output_rate = audio.sample_rate;
     let mut next_deadline = MonotonicTimer::now_ns() + NTSC_FRAME_NS;
@@ -821,6 +835,9 @@ fn worker_main(shared: Arc<RtSharedState>, cmd_rx: Receiver<EmulatorCommand>) {
                         prev.save_sram();
                     }
                     saved = Default::default();
+                    rewind_ring.clear();
+                    shared.paused.store(false, Ordering::Release);
+                    shared.step_frames.store(0, Ordering::Release);
                     match System::new(*cart) {
                         Ok(s) => {
                             let mut s = Box::new(s);
@@ -846,6 +863,9 @@ fn worker_main(shared: Arc<RtSharedState>, cmd_rx: Receiver<EmulatorCommand>) {
                     }
                     sys = None;
                     saved = Default::default();
+                    rewind_ring.clear();
+                    shared.paused.store(false, Ordering::Release);
+                    shared.step_frames.store(0, Ordering::Release);
                     shared.rom_loaded.store(false, Ordering::Release);
                     let blank = vec![0u8; FRAMEBUFFER_BYTES];
                     shared.framebuffer.publish_frame((&blank[..]).try_into().unwrap());
@@ -949,7 +969,37 @@ fn worker_main(shared: Arc<RtSharedState>, cmd_rx: Receiver<EmulatorCommand>) {
 
         // ---- Produce the frame.
         let t0 = MonotonicTimer::now_ns();
-        if let Some(s) = &mut sys {
+        let rewinding = shared.rewind_active.load(Ordering::Acquire);
+        let paused = shared.paused.load(Ordering::Acquire);
+        let step_req = if paused {
+            shared
+                .step_frames
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| (v > 0).then(|| v - 1))
+                .is_ok()
+        } else {
+            shared.step_frames.store(0, Ordering::Release);
+            false
+        };
+
+        if rewinding && sys.is_some() {
+            let _ = shared.buttons_latched.swap(0, Ordering::AcqRel);
+            let _ = shared.buttons_latched_p2.swap(0, Ordering::AcqRel);
+            if let Some(mut snap) = rewind_ring.pop_back() {
+                snap.set_overclock(overclock);
+                snap.joypad.live_p1 = Some(shared.buttons_held.clone());
+                snap.joypad.live_p2 = Some(shared.buttons_held_p2.clone());
+                display_fb.copy_from_slice(&snap.ppu.framebuffer);
+                shared.framebuffer.publish_frame((&display_fb[..]).try_into().unwrap());
+                shared.notify_frame();
+                sys = Some(snap);
+            } else {
+                shared.notify_frame();
+            }
+            audio.flush();
+        } else if paused && !step_req {
+            // While paused without a frame-step request, keep UI synced without advancing the NES.
+            shared.notify_frame();
+        } else if let Some(s) = &mut sys {
             s.joypad.buttons_p1 = shared.buttons_latched.swap(0, Ordering::AcqRel);
             s.joypad.buttons_p2 = shared.buttons_latched_p2.swap(0, Ordering::AcqRel);
             let zx = shared.zapper_x.load(Ordering::Acquire);
@@ -957,21 +1007,38 @@ fn worker_main(shared: Arc<RtSharedState>, cmd_rx: Receiver<EmulatorCommand>) {
             let ztrig = shared.zapper_trigger.swap(0, Ordering::AcqRel);
             s.joypad.set_zapper(zx, zy, ztrig);
             s.apu.output_rate = output_rate;
-            let ahead = shared.run_ahead.load(Ordering::Acquire);
-            s.run_frame_ahead(ahead, &mut display_fb);
+            let ff = shared.fast_forward.load(Ordering::Acquire) && !paused;
+            if ff {
+                // Fast-forward: run an extra frame first and decimate audio 2:1 so pitch/tempo double cleanly.
+                s.run_frame();
+                s.apu.audio_samples.clear();
+                s.run_frame();
+                display_fb.copy_from_slice(&s.ppu.framebuffer);
+            } else {
+                let ahead = shared.run_ahead.load(Ordering::Acquire);
+                s.run_frame_ahead(ahead, &mut display_fb);
+            }
             output_rate = audio.push(&mut s.apu.audio_samples);
             shared.framebuffer.publish_frame((&display_fb[..]).try_into().unwrap());
             shared.notify_frame();
 
             let n = shared.frames_executed.fetch_add(1, Ordering::Relaxed);
+            if n % 2 == 0 {
+                if rewind_ring.len() >= 300 {
+                    rewind_ring.pop_front();
+                }
+                rewind_ring.push_back(s.clone());
+            }
             if n % 600 == 599 {
                 // Persist battery RAM every ~10 s so a crash doesn't lose saves.
                 s.save_sram();
             }
             // Cost estimate: jump up immediately, decay slowly (tracks the worst case).
             let cost = MonotonicTimer::now_ns() - t0;
-            cost_est = if cost > cost_est { cost } else { cost_est - (cost_est - cost) / 64 };
-            shared.frame_cost_ns.store(cost_est, Ordering::Relaxed);
+            if !ff {
+                cost_est = if cost > cost_est { cost } else { cost_est - (cost_est - cost) / 64 };
+                shared.frame_cost_ns.store(cost_est, Ordering::Relaxed);
+            }
         } else {
             let _ = shared.buttons_latched.swap(0, Ordering::AcqRel);
             let _ = shared.buttons_latched_p2.swap(0, Ordering::AcqRel);

@@ -120,6 +120,15 @@ pub fn probe_rt_capabilities() -> RtCapabilities {
             caps.max_rtprio = (rlim.rlim_cur as i32).clamp(0, 99);
         }
     }
+    #[cfg(target_os = "windows")]
+    {
+        caps.kernel_release = "Windows (non-RT)".to_string();
+        caps.kernel_version = "Win32 Multimedia Timer + High Priority".to_string();
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        caps.kernel_release = std::env::consts::OS.to_string();
+    }
     // /sys/kernel/realtime exists (= 1) only on PREEMPT_RT kernels.
     caps.preempt_rt_kernel = std::fs::read_to_string("/sys/kernel/realtime").map(|s| s.trim() == "1").unwrap_or(false)
         || caps.kernel_version.contains("PREEMPT_RT");
@@ -134,7 +143,8 @@ pub fn probe_rt_capabilities() -> RtCapabilities {
 }
 
 /// Applies or relaxes SCHED_FIFO scheduling, memory locking, timer slack and CPU pinning
-/// for the calling thread. Returns the SCHED_FIFO priority obtained, if any.
+/// for the calling thread on Linux, or 1 ms timer resolution (`timeBeginPeriod`) and
+/// `THREAD_PRIORITY_HIGHEST` on Windows. Returns the SCHED_FIFO priority obtained, if any.
 pub fn apply_thread_scheduling(enable_rt: bool, caps: &RtCapabilities) -> Option<i32> {
     #[cfg(target_os = "linux")]
     unsafe {
@@ -175,14 +185,43 @@ pub fn apply_thread_scheduling(enable_rt: bool, caps: &RtCapabilities) -> Option
             None
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    unsafe {
+        #[link(name = "winmm")]
+        unsafe extern "system" {
+            /// Requests a minimum resolution `uPeriod` (ms) for periodic timers.
+            fn timeBeginPeriod(uPeriod: u32) -> u32;
+            /// Clears a previously requested minimum timer resolution.
+            fn timeEndPeriod(uPeriod: u32) -> u32;
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            /// Returns a pseudo-handle for the calling thread.
+            fn GetCurrentThread() -> *mut std::ffi::c_void;
+            /// Sets the scheduling priority of `hThread`.
+            fn SetThreadPriority(hThread: *mut std::ffi::c_void, nPriority: i32) -> i32;
+        }
+        let _ = caps;
+        if enable_rt {
+            let _ = timeBeginPeriod(1);
+            // THREAD_PRIORITY_HIGHEST = 2
+            let _ = SetThreadPriority(GetCurrentThread(), 2);
+        } else {
+            // THREAD_PRIORITY_NORMAL = 0
+            let _ = SetThreadPriority(GetCurrentThread(), 0);
+            let _ = timeEndPeriod(1);
+        }
+        None
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let _ = (enable_rt, caps);
         None
     }
 }
 
-/// `CLOCK_MONOTONIC` time source with precise absolute-deadline sleeping.
+/// Monotonic nanosecond time source (`CLOCK_MONOTONIC` on Linux, `QueryPerformanceCounter`
+/// via `std::time::Instant` elsewhere) with precise absolute-deadline sleeping.
 pub struct MonotonicTimer;
 
 impl MonotonicTimer {
@@ -200,12 +239,15 @@ impl MonotonicTimer {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            0
+            /// Process-start epoch used to produce monotonic nanosecond timestamps on non-Linux hosts.
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            EPOCH.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
         }
     }
 
-    /// Sleeps until the absolute time `target_ns`. With `rt_spin_guard`, wakes ~80 µs early and
-    /// busy-waits the remainder for microsecond precision. Returns lateness in ns (negative = early).
+    /// Sleeps until the absolute time `target_ns`. With `rt_spin_guard`, wakes early (~80 µs on
+    /// Linux, ~1.5 ms on Windows/other OSes where OS sleep granularity is ~1 ms) and busy-waits
+    /// the remainder for microsecond precision. Returns lateness in ns (negative = early).
     #[inline]
     pub fn sleep_until_ns(target_ns: u64, rt_spin_guard: bool) -> i64 {
         #[cfg(target_os = "linux")]
@@ -240,8 +282,21 @@ impl MonotonicTimer {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (target_ns, rt_spin_guard);
-            0
+            // Windows / non-Linux: even with timeBeginPeriod(1), thread::sleep can oversleep by
+            // ~1-1.5 ms, so wake early and spin the final window when spin-guard pacing is enabled.
+            let spin_guard_ns = if rt_spin_guard { 1_500_000 } else { 0 };
+            let sleep_target = target_ns.saturating_sub(spin_guard_ns);
+            let now = Self::now_ns();
+            if sleep_target > now {
+                std::thread::sleep(std::time::Duration::from_nanos(sleep_target - now));
+            }
+            if rt_spin_guard {
+                while Self::now_ns() < target_ns {
+                    std::hint::spin_loop();
+                }
+            }
+            let actual = Self::now_ns();
+            (actual as i128 - target_ns as i128) as i64
         }
     }
 }
@@ -372,10 +427,14 @@ pub struct RtSharedState {
     pub caps: RtCapabilities,
     /// Finished frames, worker → UI.
     pub framebuffer: TripleFramebuffer,
-    /// Held buttons, read by the emulated controller at strobe time.
+    /// Held Player 1 buttons, read by the emulated controller at strobe time.
     pub buttons_held: Arc<AtomicU8>,
-    /// Buttons pressed since the last emulated frame (so sub-frame taps aren't lost).
+    /// Player 1 buttons pressed since the last emulated frame (so sub-frame taps aren't lost).
     pub buttons_latched: AtomicU8,
+    /// Held Player 2 buttons, read by the emulated controller at strobe time.
+    pub buttons_held_p2: Arc<AtomicU8>,
+    /// Player 2 buttons pressed since the last emulated frame.
+    pub buttons_latched_p2: AtomicU8,
     /// Cleared to stop the worker.
     pub running: AtomicBool,
     /// A cartridge is inserted and running.
@@ -415,15 +474,18 @@ pub struct RtSharedState {
 }
 
 impl RtSharedState {
-    /// Probes capabilities; RT mode defaults on when SCHED_FIFO is permitted.
+    /// Probes capabilities; RT mode defaults on when SCHED_FIFO is permitted (or on Windows where
+    /// it enables 1 ms timer periods and high thread priority).
     pub fn new() -> Self {
         let caps = probe_rt_capabilities();
-        let default_rt = caps.preempt_rt_kernel || caps.max_rtprio > 0;
+        let default_rt = caps.preempt_rt_kernel || caps.max_rtprio > 0 || cfg!(target_os = "windows");
         Self {
             caps,
             framebuffer: TripleFramebuffer::new(),
             buttons_held: Arc::new(AtomicU8::new(0)),
             buttons_latched: AtomicU8::new(0),
+            buttons_held_p2: Arc::new(AtomicU8::new(0)),
+            buttons_latched_p2: AtomicU8::new(0),
             running: AtomicBool::new(true),
             rom_loaded: AtomicBool::new(false),
             rt_mode_enabled: AtomicBool::new(default_rt),
@@ -444,13 +506,22 @@ impl RtSharedState {
         }
     }
 
-    /// UI thread: publishes the controller state. `newly_pressed_mask` latches presses so taps
+    /// UI thread: publishes Player 1 controller state. `newly_pressed_mask` latches presses so taps
     /// shorter than a frame still register.
     #[inline]
     pub fn update_input(&self, held_mask: u8, newly_pressed_mask: u8) {
         self.buttons_held.store(held_mask, Ordering::Release);
         if newly_pressed_mask != 0 {
             self.buttons_latched.fetch_or(newly_pressed_mask, Ordering::AcqRel);
+        }
+    }
+
+    /// UI thread: publishes Player 2 controller state.
+    #[inline]
+    pub fn update_input_p2(&self, held_mask: u8, newly_pressed_mask: u8) {
+        self.buttons_held_p2.store(held_mask, Ordering::Release);
+        if newly_pressed_mask != 0 {
+            self.buttons_latched_p2.fetch_or(newly_pressed_mask, Ordering::AcqRel);
         }
     }
 
@@ -646,6 +717,7 @@ fn worker_main(shared: Arc<RtSharedState>, cmd_rx: Receiver<EmulatorCommand>) {
                             let mut s = Box::new(s);
                             s.set_overclock(overclock);
                             s.joypad.live_p1 = Some(shared.buttons_held.clone());
+                            s.joypad.live_p2 = Some(shared.buttons_held_p2.clone());
                             sys = Some(s);
                             shared.rom_loaded.store(true, Ordering::Release);
                         }
@@ -740,6 +812,7 @@ fn worker_main(shared: Arc<RtSharedState>, cmd_rx: Receiver<EmulatorCommand>) {
         let t0 = MonotonicTimer::now_ns();
         if let Some(s) = &mut sys {
             s.joypad.buttons_p1 = shared.buttons_latched.swap(0, Ordering::AcqRel);
+            s.joypad.buttons_p2 = shared.buttons_latched_p2.swap(0, Ordering::AcqRel);
             s.apu.output_rate = output_rate;
             let ahead = shared.run_ahead.load(Ordering::Acquire);
             s.run_frame_ahead(ahead, &mut display_fb);
@@ -758,6 +831,7 @@ fn worker_main(shared: Arc<RtSharedState>, cmd_rx: Receiver<EmulatorCommand>) {
             shared.frame_cost_ns.store(cost_est, Ordering::Relaxed);
         } else {
             let _ = shared.buttons_latched.swap(0, Ordering::AcqRel);
+            let _ = shared.buttons_latched_p2.swap(0, Ordering::AcqRel);
         }
 
         if stats_enabled && sys.is_some() {

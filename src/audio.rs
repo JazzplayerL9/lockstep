@@ -254,14 +254,28 @@ pub struct AudioOut {
     pushes_since_start: u32,
 }
 
-/// Promote the calling thread to SCHED_FIFO at `prio` (best effort).
+/// Promote the calling thread to SCHED_FIFO at `prio` on Linux, or `THREAD_PRIORITY_TIME_CRITICAL`
+/// on Windows (best effort).
 pub fn promote_current_thread(prio: i32) -> bool {
     #[cfg(target_os = "linux")]
     unsafe {
         let param = libc::sched_param { sched_priority: prio };
         libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param) == 0
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    unsafe {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            /// Returns a pseudo-handle for the calling thread.
+            fn GetCurrentThread() -> *mut std::ffi::c_void;
+            /// Sets the scheduling priority of `hThread`.
+            fn SetThreadPriority(hThread: *mut std::ffi::c_void, nPriority: i32) -> i32;
+        }
+        let _ = prio;
+        // THREAD_PRIORITY_TIME_CRITICAL = 15
+        SetThreadPriority(GetCurrentThread(), 15) != 0
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let _ = prio;
         false

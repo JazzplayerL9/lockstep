@@ -13,7 +13,9 @@ use std::sync::atomic::Ordering;
 
 use macroquad::prelude::*;
 use lockstep_core::cartridge::Cartridge;
-use lockstep_core::input::{BTN_A, BTN_B, BTN_DOWN, BTN_LEFT, BTN_RIGHT, BTN_SELECT, BTN_START, BTN_UP};
+use lockstep_core::input::{
+    BTN_A, BTN_B, BTN_DOWN, BTN_LEFT, BTN_RIGHT, BTN_SELECT, BTN_START, BTN_UP, GamepadHub,
+};
 use lockstep_core::mappers;
 use lockstep_core::ppu::{SCREEN_HEIGHT, SCREEN_WIDTH};
 use lockstep_core::rt::{DisplayClock, EmulatorCommand, RtSharedState, spawn_emulator_worker};
@@ -185,6 +187,16 @@ fn rt_status_lines(shared: &RtSharedState) -> (String, String) {
         "Free-run 60.10 Hz".to_string()
     };
     let prio = shared.sched_fifo_prio.load(Ordering::Acquire);
+    let rt_on = shared.rt_mode_enabled.load(Ordering::Acquire);
+    let sched_label = if prio > 0 {
+        format!("SCHED_FIFO {prio}")
+    } else if cfg!(target_os = "windows") && rt_on {
+        "Win32 High-Prio (1 ms)".to_string()
+    } else if cfg!(target_os = "linux") {
+        "SCHED_OTHER".to_string()
+    } else {
+        "Standard".to_string()
+    };
     let audio = match shared.audio_stats.get() {
         Some(a) => format!(
             "Audio buffer {:.1}-{:.1} ms, DRC {:+} ppm, {} underruns{}",
@@ -201,7 +213,7 @@ fn rt_status_lines(shared: &RtSharedState) -> (String, String) {
         sync,
         shared.frame_cost_ns.load(Ordering::Relaxed) as f64 / 1e6,
         shared.run_ahead.load(Ordering::Acquire),
-        if prio > 0 { format!("SCHED_FIFO {prio}") } else { "SCHED_OTHER".to_string() },
+        sched_label,
         shared.max_abs_jitter_ns.load(Ordering::Relaxed) as f64 / 1000.0,
     );
     (line1, audio)
@@ -323,10 +335,15 @@ USAGE:
 
 ENVIRONMENT:
     LOCKSTEP_ROM_DIR   Directory the ROM browser opens in by default
-    LOCKSTEP_RT_PRIO   SCHED_FIFO priority of the emulation thread (default 45)
+    LOCKSTEP_RT_PRIO   SCHED_FIFO priority of the emulation thread (default 45, Linux)
+    LOCKSTEP_PAD_SWAP  If set, swap South/East gamepad buttons (Nintendo A/B layout)
     LOCKSTEP_STATS     If set, print real-time statistics to stderr every 2 s
 
-KEYS (in game):
+KEYS & GAMEPADS:
+    USB / Bluetooth controllers (P1 & P2) are detected automatically via plug-and-play.
+    D-pad / Left Stick: directions   South / North / R1 / R2: A   West / East / L1 / L2: B
+    Start / Select: Start / Select   Guide (or Select+Start): ROM browser
+
     Arrows / WASD   D-pad          Z / J / Space   A
     X / K / LShift  B              Enter           Start
     RShift / Tab    Select         R               Reset
@@ -412,6 +429,7 @@ async fn run() {
     let mut display_clock = DisplayClock::new();
     let mut last_drawn_seq = 0u64;
     let mut fullscreen = false;
+    let mut gamepad_hub = GamepadHub::new();
 
     loop {
         let now = get_time();
@@ -421,8 +439,14 @@ async fn run() {
             toast_timer = (toast_timer - dt).max(0.0);
         }
 
-        // Global Hotkeys
-        if is_key_pressed(KeyCode::F1) || is_key_pressed(KeyCode::Escape) {
+        let pad = gamepad_hub.poll();
+        for note in pad.notifications {
+            toast_text = note;
+            toast_timer = 3.0;
+        }
+
+        // Global Hotkeys (keyboard or gamepad Guide / Select+Start chord)
+        if is_key_pressed(KeyCode::F1) || is_key_pressed(KeyCode::Escape) || pad.toggle_browser {
             if shared.rom_loaded.load(Ordering::Acquire) {
                 show_browser = !show_browser;
                 if show_browser {
@@ -446,9 +470,13 @@ async fn run() {
             let next_rt = !shared.rt_mode_enabled.load(Ordering::Acquire);
             let _ = cmd_tx.send(EmulatorCommand::SetRtMode(next_rt));
             toast_text = if next_rt {
-                "Scheduling: PREEMPT_RT / SCHED_FIFO Enabled".to_string()
+                if cfg!(target_os = "linux") {
+                    "Scheduling: PREEMPT_RT / SCHED_FIFO Enabled".to_string()
+                } else {
+                    "Scheduling: High Priority + 1 ms Timer + Spin Guard".to_string()
+                }
             } else {
-                "Scheduling: Standard (SCHED_OTHER)".to_string()
+                "Scheduling: Standard".to_string()
             };
             toast_timer = 3.0;
         }
@@ -500,18 +528,30 @@ async fn run() {
         if show_browser {
             // Pause controller input to the game while browsing files
             shared.update_input(0, 0);
+            shared.update_input_p2(0, 0);
 
             let n = browser.entries.len();
-            if rep_up.fire(is_key_down(KeyCode::Up), dt) && browser.selected > 0 {
+            let up_down = is_key_down(KeyCode::Up) || (pad.p1_held & BTN_UP != 0);
+            let down_down = is_key_down(KeyCode::Down) || (pad.p1_held & BTN_DOWN != 0);
+            let pgup_down = is_key_down(KeyCode::PageUp)
+                || is_key_down(KeyCode::Left)
+                || (pad.p1_held & BTN_LEFT != 0)
+                || pad.p1_page_up;
+            let pgdn_down = is_key_down(KeyCode::PageDown)
+                || is_key_down(KeyCode::Right)
+                || (pad.p1_held & BTN_RIGHT != 0)
+                || pad.p1_page_down;
+
+            if rep_up.fire(up_down, dt) && browser.selected > 0 {
                 browser.selected -= 1;
             }
-            if rep_down.fire(is_key_down(KeyCode::Down), dt) && browser.selected + 1 < n {
+            if rep_down.fire(down_down, dt) && browser.selected + 1 < n {
                 browser.selected += 1;
             }
-            if rep_pgup.fire(is_key_down(KeyCode::PageUp) || is_key_down(KeyCode::Left), dt) {
+            if rep_pgup.fire(pgup_down, dt) {
                 browser.selected = browser.selected.saturating_sub(20);
             }
-            if rep_pgdn.fire(is_key_down(KeyCode::PageDown) || is_key_down(KeyCode::Right), dt) && n > 0 {
+            if rep_pgdn.fire(pgdn_down, dt) && n > 0 {
                 browser.selected = (browser.selected + 20).min(n - 1);
             }
             if is_key_pressed(KeyCode::Home) {
@@ -520,45 +560,49 @@ async fn run() {
             if is_key_pressed(KeyCode::End) && !browser.entries.is_empty() {
                 browser.selected = browser.entries.len() - 1;
             }
-            if is_key_pressed(KeyCode::Backspace)
-                && let Some(parent) = browser.current_dir.parent() {
-                    browser.current_dir = parent.to_path_buf();
+            if (is_key_pressed(KeyCode::Backspace) || (pad.p1_pressed & BTN_B != 0))
+                && let Some(parent) = browser.current_dir.parent()
+            {
+                browser.current_dir = parent.to_path_buf();
+                browser.selected = 0;
+                browser.refresh();
+            }
+            if (is_key_pressed(KeyCode::Enter)
+                || (pad.p1_pressed & (BTN_A | BTN_START) != 0 && !pad.toggle_browser))
+                && let Some(item) = browser.entries.get(browser.selected).cloned()
+            {
+                if item.is_dir {
+                    browser.current_dir = item.path;
                     browser.selected = 0;
                     browser.refresh();
-                }
-            if is_key_pressed(KeyCode::Enter)
-                && let Some(item) = browser.entries.get(browser.selected).cloned() {
-                    if item.is_dir {
-                        browser.current_dir = item.path;
-                        browser.selected = 0;
-                        browser.refresh();
-                    } else {
-                        match Cartridge::from_file(&item.path) {
-                            Ok(cart) => match describe_cart(&cart) {
-                                Ok(info) => {
-                                    current_rom_info = info;
-                                    let _ = cmd_tx.send(EmulatorCommand::LoadRom(Box::new(cart)));
-                                    show_browser = false;
-                                    toast_text = format!("Loaded {}", current_rom_info);
-                                    toast_timer = 3.0;
-                                }
-                                Err(e) => browser.status_msg = e,
-                            },
-                            Err(e) => {
-                                browser.status_msg = e;
+                } else {
+                    match Cartridge::from_file(&item.path) {
+                        Ok(cart) => match describe_cart(&cart) {
+                            Ok(info) => {
+                                current_rom_info = info;
+                                let _ = cmd_tx.send(EmulatorCommand::LoadRom(Box::new(cart)));
+                                show_browser = false;
+                                toast_text = format!("Loaded {}", current_rom_info);
+                                toast_timer = 3.0;
                             }
+                            Err(e) => browser.status_msg = e,
+                        },
+                        Err(e) => {
+                            browser.status_msg = e;
                         }
                     }
                 }
+            }
         } else {
             if is_key_pressed(KeyCode::R) {
                 let _ = cmd_tx.send(EmulatorCommand::Reset);
                 toast_text = "NES Reset".to_string();
                 toast_timer = 1.5;
             }
-            let held = poll_joypad_buttons();
-            let pressed = poll_joypad_pressed();
+            let held = poll_joypad_buttons() | pad.p1_held;
+            let pressed = poll_joypad_pressed() | pad.p1_pressed;
             shared.update_input(held, pressed);
+            shared.update_input_p2(pad.p2_held, pad.p2_pressed);
         }
 
         // Display sync: wait (bounded) for the frame the worker is producing just in
@@ -650,11 +694,21 @@ async fn run() {
                 24.0,
                 Color::new(0.55, 0.80, 1.0, 1.0),
             );
+            let host_info = if cfg!(target_os = "linux") {
+                format!(
+                    "Kernel {} (PREEMPT_RT={}, RTPRIO={})",
+                    shared.caps.kernel_release, shared.caps.preempt_rt_kernel, shared.caps.max_rtprio
+                )
+            } else {
+                shared.caps.kernel_release.clone()
+            };
             draw_text(
                 &fit_text(
                     &format!(
-                        "{}  |  Kernel {} (PREEMPT_RT={}, RTPRIO={})",
-                        current_rom_info, shared.caps.kernel_release, shared.caps.preempt_rt_kernel, shared.caps.max_rtprio
+                        "{}  |  {}  |  {}",
+                        current_rom_info,
+                        host_info,
+                        gamepad_hub.status_summary()
                     ),
                     text_w,
                     16,

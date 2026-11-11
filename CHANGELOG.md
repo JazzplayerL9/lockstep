@@ -14,8 +14,16 @@ The project was renamed from `nes-rt-emu` to **Lockstep** and licensed under the
   adaptive presentation margin and a worst-case frame-cost estimator.
 - **Run-ahead** (F7: 0/1/2 frames), implemented in the core as `System::run_frame_ahead`
   and verified bit-exact by a test.
-- **Late input sampling**: the controller state is read when the game strobes `$4016`.
-  Opposing D-pad directions are filtered.
+- **Late input sampling**: the controller state is read when the game strobes `$4016`
+  (both Player 1 and Player 2). Opposing D-pad directions are filtered.
+- **Plug-and-play USB / Bluetooth gamepads**: automatic hot-plug detection for Player 1
+  and Player 2 controllers via `gilrs` (`evdev`/`udev` on Linux, `XInput`/`RawInput` on
+  Windows), full ROM-browser navigation from the pad, toast notifications on connect /
+  disconnect, and `LOCKSTEP_PAD_SWAP=1` for Nintendo A/B button labels.
+- **Windows support**: portable monotonic nanosecond clock (`QueryPerformanceCounter` via
+  `std::time::Instant`), 1 ms multimedia timer period (`timeBeginPeriod(1)`), high-priority
+  emulation (`THREAD_PRIORITY_HIGHEST`) and audio (`THREAD_PRIORITY_TIME_CRITICAL`) threads,
+  and spin-assisted deadline sleeping on non-RT OSes.
 - **New audio backend**: direct ALSA/PipeWire output through `cpal`, a lock-free ring
   buffer, PI dynamic rate control (±1.5 %) with anti-windup and a self-tuning buffer
   target, an underrun fade-out, and a SCHED_FIFO audio thread. Replaces the `paplay`

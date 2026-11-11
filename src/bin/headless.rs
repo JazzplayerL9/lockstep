@@ -68,6 +68,7 @@ fn scripted_input(script: &str, frame: u32) -> u8 {
 // ---- Minimal SIGPROF sampling profiler (`LOCKSTEP_PROFILE=1`), symbolised with addr2line.
 /// Minimal SIGPROF sampling profiler (`LOCKSTEP_PROFILE=1`). Samples the interrupted
 /// instruction pointer every 200 µs of CPU time; `report` symbolises them with `addr2line`.
+#[cfg(target_os = "linux")]
 mod prof {
     use std::sync::atomic::{AtomicUsize, Ordering};
     /// Maximum number of samples kept.
@@ -140,6 +141,17 @@ mod prof {
     }
 }
 
+/// Stub profiler for non-Linux hosts where `SIGPROF` / `/proc/self/maps` are not available.
+#[cfg(not(target_os = "linux"))]
+mod prof {
+    /// Prints a notice that `SIGPROF` profiling is Linux-only.
+    pub fn start() {
+        eprintln!("[lockstep-headless] LOCKSTEP_PROFILE is only supported on Linux");
+    }
+    /// No-op on non-Linux hosts.
+    pub fn report() {}
+}
+
 /// Reads CPU memory for result inspection (RAM directly, everything else through the mapper).
 fn peek(sys: &mut System, addr: u16) -> u8 {
     if addr < 0x2000 { sys.ram[(addr & 0x7FF) as usize] } else { sys.mapper.cpu_read(addr).unwrap_or(0) }
@@ -202,9 +214,12 @@ fn run_test_rom(path: &str) -> (bool, String) {
             _ => {}
         }
     }
-    let shot = format!("/tmp/nestest_{}.png", Path::new(path).file_stem().unwrap().to_string_lossy());
-    save_png(&sys, Path::new(&shot));
-    (false, format!("no $6000 result (screenshot {shot})"))
+    let shot = std::env::temp_dir().join(format!(
+        "nestest_{}.png",
+        Path::new(path).file_stem().unwrap().to_string_lossy()
+    ));
+    save_png(&sys, &shot);
+    (false, format!("no $6000 result (screenshot {})", shot.display()))
 }
 
 /// One row of `summary.tsv`.

@@ -60,10 +60,16 @@ lockstep "Super Mario Bros. 3 (USA).zip"
   PREEMPT_RT kernels are detected.
 
 **Convenience**
+- **Plug-and-play USB / Bluetooth gamepads** (Player 1 & Player 2) via `gilrs` (`evdev`/`udev`
+  on Linux, `XInput`/`RawInput` on Windows), with hot-plug notifications and full ROM-browser
+  navigation from the controller.
 - Loads `.nes`, NES 2.0 headers, `.zip` archives, and known **headerless** dumps.
 - Corrects known-bad iNES headers by CRC (wrong mapper, mirroring or battery flags).
 - Battery saves (`<rom>.sav`, written every ~10 s and on exit), instant save state, reset.
 - ROM browser with hold-to-scroll, overscan crop, fullscreen, optional "overclock".
+- **Cross-platform (Linux & Windows)**: full real-time `PREEMPT_RT` / `SCHED_FIFO` support on
+  Linux; runs natively on Windows with `QueryPerformanceCounter` timing, 1 ms multimedia timer
+  periods (`timeBeginPeriod(1)`), high thread priority, WASAPI audio, and XInput gamepads.
 
 ---
 
@@ -89,8 +95,10 @@ cargo run --release -- path/to/game.nes
 `opt-level = 3` because a cycle-accurate core is far too slow unoptimized. It runs at
 roughly 350–400 emulated frames per second on one modern core.
 
-Lockstep targets Linux. The emulation core (`lockstep_core`) is portable, but the
-real-time layer uses Linux scheduling APIs, which are compiled out elsewhere.
+Lockstep targets Linux first (where `PREEMPT_RT` and `SCHED_FIFO` are available) and also
+builds and runs natively on Windows (using Win32 high-priority threads, `timeBeginPeriod(1)`,
+and `QueryPerformanceCounter` spin-assisted pacing, since Windows does not offer a real-time
+scheduler).
 
 ---
 
@@ -128,13 +136,23 @@ priority, worst-case jitter, and audio buffer level, DRC correction and underrun
 
 ## Controls
 
-| NES | Keyboard |
-|---|---|
-| D-pad | Arrow keys or W A S D |
-| A | Z, J or Space |
-| B | X, K or Left Shift |
-| Start | Enter |
-| Select | Right Shift, Tab or Backspace |
+Up to two USB or Bluetooth controllers (Player 1 and Player 2) are detected automatically via
+plug-and-play — even if plugged in or reconnected while a game is running. Player 1 combines
+keyboard and the first gamepad; a second gamepad drives Player 2.
+
+| NES | Keyboard (P1) | Gamepad (P1 & P2) |
+|---|---|---|
+| D-pad | Arrow keys or W A S D | D-pad or Left Analog Stick |
+| A | Z, J or Space | South (A / Cross), North (Y / Triangle), R1 or R2 |
+| B | X, K or Left Shift | West (X / Square), East (B / Circle), L1 or L2 |
+| Start | Enter | Start |
+| Select | Right Shift, Tab or Backspace | Select / Back |
+| ROM Browser | Esc or F1 | Guide / Mode button, or Select + Start |
+
+Set `LOCKSTEP_PAD_SWAP=1` if you prefer Nintendo face-button labels (`East` = A, `South` = B).
+In the ROM browser, the D-pad / Left Stick moves the selection, L1 / R1 pages by 20 entries,
+**A** or **Start** loads the selected ROM (or enters a folder), and **B** ascends to the parent
+directory.
 
 Pressing opposing directions at the same time (impossible on a real pad) is filtered, because
 some games crash on it.

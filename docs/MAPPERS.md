@@ -32,6 +32,8 @@ the board (see [ACCURACY.md](ACCURACY.md#game-compatibility-testing)).
 | 10 | MMC4 (FxROM) | `mmc2.rs` | 0 | Fire Emblem (JP) — *untested* |
 | 11 | Color Dreams | `gxrom.rs` | 0 | Crystal Mines — *untested* |
 | 13 | CPROM | `cprom.rs` | 1 | Videomation |
+| 19 | Namco 163 / 129 | `n163.rs` | 0 | Megami Tensei II, Rolling Thunder (JP), Splatterhouse (JP), Erika to Satoru |
+| 24, 26 | Konami VRC6a / VRC6b | `vrc6.rs` | 0 | Akumajou Densetsu (Castlevania III JP), Madara, Esper Dream 2 |
 | 34 | BNROM / NINA-001 | `gxrom.rs` | 1 | Deadly Towers |
 | 47 | NES-QJ (MMC3 multicart) | `mmc3.rs` | 1 | Super Spike V'Ball + Nintendo World Cup |
 | 66 | GxROM / MxROM | `gxrom.rs` | 4 | Super Mario Bros. + Duck Hunt, Gumshoe, Dragon Power |
@@ -83,15 +85,26 @@ the **vertical split screen**; an 8×8→16 multiplier; and the scanline IRQ.
 The MMC5 has no scanline input, so it infers PPU state from the fetches it sees: three
 consecutive reads of the same nametable address mark the start of a scanline, and 3 CPU
 cycles without PPU reads mean rendering has stopped. Lockstep reproduces this exactly
-from the PPU's real fetch pattern. Expansion audio is not emulated.
+from the PPU's real fetch pattern. Two expansion pulse channels (`$5000-$5007`, `$5015`)
+and the 8-bit raw PCM channel + IRQ (`$5010-$5011`) are also emulated.
 
 **MMC2 / MMC4.** Two CHR banks per pattern table, selected by latches that flip when the
 PPU fetches tile `$FD` or `$FE` (Punch-Out!!'s large opponent sprites). The latch
 switches *after* the triggering fetch, which `notify_vram_addr` models.
 
-**FME-7.** Eight 1 KB CHR banks, four 8 KB PRG banks (including `$6000`, which can be ROM
-or RAM), mirroring control, and a 16-bit CPU-cycle IRQ counter. Sunsoft 5B audio is not
-emulated.
+**FME-7 / Sunsoft 5B (69).** Eight 1 KB CHR banks, four 8 KB PRG banks (including `$6000`,
+which can be ROM or RAM), mirroring control, a 16-bit CPU-cycle IRQ counter, and the
+Sunsoft 5B's 3-channel YM2149F tone + noise PSG expansion audio (`$C000`/`$E000`).
+
+**Konami VRC6 (24, 26).** 16 KB + 8 KB switchable PRG banks, eight 1 KB CHR banks with
+configurable 1 KB / 2 KB modes and mirroring (`$B003`), scanline/cycle IRQ counter
+(`$F000-$F002`), and VRC6 expansion audio (two 16-step variable-duty pulse channels plus
+a 6-bit sawtooth accumulator).
+
+**Namco 163 (19).** Three 8 KB switchable PRG banks, eight 1 KB CHR banks and four 1 KB
+nametable banks (each selectable between CHR-ROM and console CIRAM), a 15-bit up-counting
+CPU-cycle IRQ timer, and 128 bytes of internal wavetable RAM driving a 1–8 channel
+multiplexed wavetable synthesizer.
 
 **Discrete boards (0, 2, 3, 7, 11, 13, 34, 66, 71, 79).** Simple latches. UxROM, CNROM, BNROM,
 CPROM, Color Dreams and GxROM model **bus conflicts**: the written value is ANDed with

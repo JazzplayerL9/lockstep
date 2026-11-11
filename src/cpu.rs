@@ -120,6 +120,88 @@ static ADDR_MODE: [Mode; 256] = [
     Rel,   IndY,  Other, IndYW, ZeroX, ZeroX, ZeroX, ZeroX, Imp,   AbsY,  Imp,   AbsYW, AbsX,  AbsX,  AbsXW, AbsXW, // F
 ];
 
+/// A decoded Game Genie (`6`- or `8`-letter) or raw hex (`AAAA:VV` / `AAAA:CC:VV`) cheat patch.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cheat {
+    /// Target CPU address (`$0000-$FFFF`).
+    pub addr: u16,
+    /// Replacement byte value.
+    pub value: u8,
+    /// Optional compare byte (`0..=255`, or `< 0` when unconditional).
+    pub compare: i16,
+}
+
+impl Cheat {
+    /// Parses a 6/8-letter NES Game Genie code (e.g. `"SXIOPO"`, `"AATOZAPA"`) or raw hex patch
+    /// (`"075A:09"` or `"D23A:00:FF"`).
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let s: String = raw
+            .trim()
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '-')
+            .collect();
+        if s.contains(':') {
+            let parts: Vec<&str> = s.split(':').collect();
+            return match parts.as_slice() {
+                [a, v] => {
+                    let addr = u16::from_str_radix(a, 16).map_err(|_| format!("Invalid cheat address: {a}"))?;
+                    let value = u8::from_str_radix(v, 16).map_err(|_| format!("Invalid cheat value: {v}"))?;
+                    Ok(Self { addr, value, compare: -1 })
+                }
+                [a, c, v] => {
+                    let addr = u16::from_str_radix(a, 16).map_err(|_| format!("Invalid cheat address: {a}"))?;
+                    let cmp = u8::from_str_radix(c, 16).map_err(|_| format!("Invalid cheat compare: {c}"))?;
+                    let value = u8::from_str_radix(v, 16).map_err(|_| format!("Invalid cheat value: {v}"))?;
+                    Ok(Self { addr, value, compare: cmp as i16 })
+                }
+                _ => Err(format!("Invalid hex cheat format: {raw}")),
+            };
+        }
+        if s.len() != 6 && s.len() != 8 {
+            return Err(format!("Game Genie code must be 6 or 8 letters: {raw}"));
+        }
+        let mut n = [0u16; 8];
+        for (i, ch) in s.chars().enumerate() {
+            n[i] = match ch.to_ascii_uppercase() {
+                'A' => 0x0,
+                'P' => 0x1,
+                'Z' => 0x2,
+                'L' => 0x3,
+                'G' => 0x4,
+                'I' => 0x5,
+                'T' => 0x6,
+                'Y' => 0x7,
+                'E' => 0x8,
+                'O' => 0x9,
+                'X' => 0xA,
+                'U' => 0xB,
+                'K' => 0xC,
+                'S' => 0xD,
+                'V' => 0xE,
+                'N' => 0xF,
+                _ => return Err(format!("Invalid Game Genie letter '{ch}' in {raw}")),
+            };
+        }
+        let addr = 0x8000
+            | ((n[3] & 7) << 12)
+            | ((n[5] & 7) << 8)
+            | ((n[4] & 8) << 8)
+            | ((n[2] & 7) << 4)
+            | ((n[1] & 8) << 4)
+            | (n[4] & 7)
+            | (n[3] & 8);
+        if s.len() == 6 {
+            let value = (((n[1] & 7) << 4) | ((n[0] & 8) << 4) | (n[0] & 7) | (n[5] & 8)) as u8;
+            Ok(Self { addr, value, compare: -1 })
+        } else {
+            let value = (((n[1] & 7) << 4) | ((n[0] & 8) << 4) | (n[0] & 7) | (n[7] & 8)) as u8;
+            let cmp = (((n[7] & 7) << 4) | ((n[6] & 8) << 4) | (n[6] & 7) | (n[5] & 8)) as i16;
+            Ok(Self { addr, value, compare: cmp })
+        }
+    }
+}
+
 /// A complete NES: the 2A03 CPU (registers and DMA engine), 2 KB of work RAM, the PPU,
 /// APU, controller ports and the cartridge mapper, all driven from one master clock.
 ///
@@ -206,6 +288,10 @@ pub struct System {
 
     /// The console's 2 KB of internal work RAM ($0000-$07FF, mirrored to $1FFF).
     pub ram: [u8; 2048],
+    /// Active Game Genie / raw memory cheats (up to 16).
+    pub cheats: [Cheat; 16],
+    /// Number of valid entries in `cheats`.
+    pub cheat_count: u8,
     /// Picture processing unit.
     pub ppu: Ppu,
     /// Audio processing unit.
@@ -264,6 +350,8 @@ impl System {
             open_bus: 0,
             apu_skipped_cycles: 0,
             ram: [0; 2048],
+            cheats: [Cheat::default(); 16],
+            cheat_count: 0,
             ppu: Ppu::new(),
             apu: Apu::new(),
             mapper,
@@ -299,8 +387,42 @@ impl System {
         {
             sys.joypad.zapper_connected = true;
         }
+        sys.load_cheats_from_env_and_file();
         sys.power_on();
         Ok(sys)
+    }
+
+    /// Parses and adds a Game Genie (`SXIOPO`) or raw hex (`075A:09`) cheat code.
+    pub fn add_cheat(&mut self, code: &str) -> Result<Cheat, String> {
+        let c = Cheat::parse(code)?;
+        if (self.cheat_count as usize) < self.cheats.len() {
+            self.cheats[self.cheat_count as usize] = c;
+            self.cheat_count += 1;
+        }
+        Ok(c)
+    }
+
+    /// Loads cheat codes from `<rom>.cht` (if present) and `$LOCKSTEP_CHEATS` (comma/space-separated).
+    fn load_cheats_from_env_and_file(&mut self) {
+        if let Some(rom_path) = &self.cart_for_sram.rom_path {
+            let cht_path = rom_path.with_extension("cht");
+            if let Ok(text) = std::fs::read_to_string(&cht_path) {
+                for line in text.lines() {
+                    let code = line.split('#').next().unwrap_or("").trim();
+                    if !code.is_empty() {
+                        let _ = self.add_cheat(code);
+                    }
+                }
+            }
+        }
+        if let Ok(env_cheats) = std::env::var("LOCKSTEP_CHEATS") {
+            for token in env_cheats.split([',', ';', ' ']) {
+                let code = token.trim();
+                if !code.is_empty() {
+                    let _ = self.add_cheat(code);
+                }
+            }
+        }
     }
 
     /// Back-compat constructor used by older call sites; panics on unsupported mappers.
@@ -609,6 +731,18 @@ impl System {
             }
             0x4000..=0x401F => self.open_bus,
             _ => self.mapper.cpu_read(addr).unwrap_or(self.open_bus),
+        };
+        let v = if self.cheat_count > 0 {
+            let mut patched = v;
+            for i in 0..(self.cheat_count as usize) {
+                let c = self.cheats[i];
+                if c.addr == addr && (c.compare < 0 || c.compare as u8 == v) {
+                    patched = c.value;
+                }
+            }
+            patched
+        } else {
+            v
         };
         self.open_bus = v;
         v
@@ -1535,5 +1669,66 @@ mod tests {
             }
         }
         assert!(saw_nonzero);
+    }
+
+    #[test]
+    fn game_genie_and_raw_cheats_patch_reads() {
+        // SXIOPO is the classic SMB1 infinite-lives 6-letter Game Genie code: addr $91D9, value $AD (LDA abs instead of DEC).
+        let c6 = Cheat::parse("SXIOPO").unwrap();
+        assert_eq!(c6.addr, 0x91D9);
+        assert_eq!(c6.value, 0xAD);
+        assert_eq!(c6.compare, -1);
+
+        // 8-letter Game Genie code with compare byte.
+        let c8 = Cheat::parse("ZEXPYGLA").unwrap();
+        assert!(c8.addr >= 0x8000);
+        assert!(c8.compare >= 0);
+
+        // Raw cheat patching CPU read at $8000 (opcode 0x4C -> 0xEA) and conditional at $8001.
+        let rom_bytes = make_test_rom(&[0x4C, 0x00, 0x80]);
+        let cart = Cartridge::from_ines_bytes(&rom_bytes, "Cheat Test".into()).unwrap();
+        let mut sys = System::new(cart).unwrap();
+        assert_eq!(sys.bus_read(0x8000), 0x4C);
+        sys.add_cheat("8000:4C:EA").unwrap();
+        sys.add_cheat("8001:99:11").unwrap(); // compare mismatch (actual is 0x00), should NOT patch
+        assert_eq!(sys.bus_read(0x8000), 0xEA);
+        assert_eq!(sys.bus_read(0x8001), 0x00);
+    }
+
+    #[test]
+    fn vrc6_and_namco163_mappers_and_expansion_audio() {
+        // 1. VRC6a (mapper 24): Pulse 1 ($9000=0x7F, $9001=10, $9002=0x80) + Saw ($B000=0x20, $B001=10, $B002=0x80).
+        let mut rom24 = make_test_rom(&[0x4C, 0x00, 0x80]);
+        rom24[6] = (24 & 0x0F) << 4;
+        rom24[7] = 24 & 0xF0;
+        let cart24 = Cartridge::from_ines_bytes(&rom24, "VRC6 Test".into()).unwrap();
+        let mut sys24 = System::new(cart24).unwrap();
+        assert!(sys24.mapper.has_expansion_audio());
+        sys24.bus_write(0x9000, 0x7F);
+        sys24.bus_write(0x9001, 10);
+        sys24.bus_write(0x9002, 0x80);
+        sys24.bus_write(0xB000, 0x20);
+        sys24.bus_write(0xB001, 10);
+        sys24.bus_write(0xB002, 0x80);
+        for _ in 0..100 {
+            sys24.mapper.cpu_clock();
+        }
+        assert!(sys24.mapper.audio_sample() < -0.05);
+
+        // 2. Namco 163 (mapper 19): write wavetable sample 0xFF at internal RAM $00, configure ch7 at $78-$7F.
+        let mut rom19 = make_test_rom(&[0x4C, 0x00, 0x80]);
+        rom19[6] = (19 & 0x0F) << 4;
+        rom19[7] = 19 & 0xF0;
+        let cart19 = Cartridge::from_ines_bytes(&rom19, "N163 Test".into()).unwrap();
+        let mut sys19 = System::new(cart19).unwrap();
+        assert!(sys19.mapper.has_expansion_audio());
+        sys19.bus_write(0xF800, 0x00);
+        sys19.bus_write(0x4800, 0xFF); // nibble = 15 (+7 centered)
+        sys19.bus_write(0xF800, 0xFF); // addr 0x7F = ch7 volume (15) & 1 active channel (0x0F)
+        sys19.bus_write(0x4800, 0x0F);
+        for _ in 0..30 {
+            sys19.mapper.cpu_clock();
+        }
+        assert!(sys19.mapper.audio_sample().abs() > 0.01);
     }
 }

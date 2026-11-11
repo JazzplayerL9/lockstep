@@ -567,6 +567,34 @@ async fn run() {
             set_fullscreen(fullscreen);
         }
 
+        if is_key_pressed(KeyCode::F12) && shared.rom_loaded.load(Ordering::Acquire) {
+            let seq = shared.frames_executed.load(Ordering::Relaxed);
+            let stem: String = current_rom_info
+                .split('[')
+                .next()
+                .unwrap_or("lockstep")
+                .trim()
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                .collect();
+            let shot_name = format!("{}_{:06}.png", stem.trim_matches('_'), seq);
+            let png_bytes = lockstep_core::png::encode_rgba(
+                SCREEN_WIDTH as u32,
+                SCREEN_HEIGHT as u32,
+                &image.bytes,
+            );
+            match fs::write(&shot_name, png_bytes) {
+                Ok(()) => {
+                    toast_text = format!("Screenshot saved: {shot_name}");
+                    toast_timer = 3.0;
+                }
+                Err(e) => {
+                    toast_text = format!("Screenshot failed: {e}");
+                    toast_timer = 3.0;
+                }
+            }
+        }
+
         if is_key_pressed(KeyCode::F6) {
             crop_overscan = !crop_overscan;
             toast_text = format!("Overscan crop: {}", if crop_overscan { "ON" } else { "OFF" });

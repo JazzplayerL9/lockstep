@@ -38,12 +38,13 @@ lockstep "Super Mario Bros. 3 (USA).zip"
   delayed `$2006`/`$2007` effects, the odd-frame dot skip, VBlank/NMI races, and open-bus decay.
 - **APU & expansion audio**: exact frame-counter and `$4017` timing, length-counter reload
   quirks, DMC sample fetches performed as real DMA that steals CPU cycles and interacts with OAM
-  DMA, plus **MMC5** (2 pulse channels + 8-bit PCM) and **Sunsoft 5B / FME-7** (3-channel YM2149F
-  PSG + noise) cartridge expansion audio.
+  DMA, plus **MMC5** (2 pulse channels + 8-bit PCM), **Konami VRC6** (2 pulse channels + 6-bit
+  sawtooth), **Namco 163** (1–8 channel wavetable synthesizer), and **Sunsoft 5B / FME-7**
+  (3-channel YM2149F PSG + noise) cartridge expansion audio.
 - **Mappers**: NROM, MMC1 (incl. SUROM / SEROM / NES-EVENT), UxROM, CNROM, MMC3 (incl. MMC6,
-  MC-ACC, TxSROM, TQROM, rev A), MMC5, AxROM, MMC2, MMC4, Color Dreams, CPROM, BNROM /
-  NINA-001, NES-QJ, GxROM, FME-7, Camerica, NINA-03/06, Namco 108. See
-  [docs/MAPPERS.md](docs/MAPPERS.md).
+  MC-ACC, TxSROM, TQROM, rev A), MMC5, AxROM, MMC2, MMC4, Color Dreams, CPROM, Namco 163,
+  Konami VRC6a/b, BNROM / NINA-001, NES-QJ, GxROM, FME-7 / Sunsoft 5B, Camerica, NINA-03/06,
+  Namco 108. See [docs/MAPPERS.md](docs/MAPPERS.md).
 - **Test ROMs**: passes blargg's CPU, PPU, APU, sprite-hit, sprite-overflow, VBL/NMI, MMC3
   and DMA test suites. See [docs/ACCURACY.md](docs/ACCURACY.md).
 
@@ -77,7 +78,8 @@ lockstep "Super Mario Bros. 3 (USA).zip"
 - Corrects known-bad iNES headers by CRC (wrong mapper, mirroring or battery flags).
 - Battery saves (`<rom>.sav`, written every ~10 s and on exit), **9 persistent disk save-state
   slots** (`<rom>.s1`..`<rom>.s9`, gzip-compressed), **real-time Rewind** (hold `Backspace`),
-  **Pause / single-frame step** (`P` / `.`), **2x Fast-Forward** (hold `` ` `` / `~`), reset.
+  **Pause / single-frame step** (`P` / `.`), **2x Fast-Forward** (hold `` ` `` / `~`), **PNG
+  screenshots** (`F12`), **Game Genie & raw hex cheats** (`<rom>.cht` / `LOCKSTEP_CHEATS`), reset.
 - ROM browser with hold-to-scroll, overscan crop, **CRT scanline + NTSC 4:3 aspect-ratio filter**
   (F10), fullscreen, optional "overclock".
 - **Cross-platform (Linux & Windows)**: full real-time `PREEMPT_RT` / `SCHED_FIFO` support on
@@ -192,6 +194,7 @@ detection on `$4017` bit 3), and **right-click** pulls the trigger aimed off-scr
 | F9 | Toggle gamepad A/B button layout swap (`South=A` vs `East=A`) |
 | F10 | Cycle display filter: Sharp 8:7 → NTSC 4:3 → CRT Scanlines 4:3 |
 | F11 | Toggle fullscreen |
+| F12 | Save PNG screenshot (`<rom>_<frame>.png`) |
 | P / . | Pause emulation / Step 1 frame forward |
 | Backspace (hold) | Real-time rewind (~10 s ring buffer) |
 | `` ` `` / `~` (hold) | 2x fast-forward |
@@ -208,6 +211,8 @@ Everything is set through environment variables; there is no config file.
 | `LOCKSTEP_ROM_DIR` | *(auto)* | Directory the ROM browser opens in |
 | `LOCKSTEP_RT_PRIO` | `45` | SCHED_FIFO priority of the emulation thread (1–99, Linux only). Audio runs one step higher. |
 | `LOCKSTEP_PAD_SWAP` | *(unset)* | If set, swap South/East gamepad buttons (`East` = A, `South` = B) |
+| `LOCKSTEP_CRT` | *(unset)* | If set, start in CRT Scanlines + NTSC 4:3 display mode |
+| `LOCKSTEP_CHEATS` | *(unset)* | Comma/space-separated 6/8-letter Game Genie (`SXIOPO`) or raw hex (`075A:09`) cheats (also loaded automatically from `<rom>.cht`) |
 | `LOCKSTEP_STATS` | *(unset)* | If set, print real-time statistics to stderr every 2 seconds |
 | `LOCKSTEP_PROFILE` | *(unset)* | `lockstep-headless shot` only (Linux): print a sampling profile |
 

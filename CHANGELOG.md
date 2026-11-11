@@ -2,6 +2,47 @@
 
 All notable changes to Lockstep. Versions follow [Semantic Versioning](https://semver.org).
 
+## 0.4.0 — Cross-Platform, Gamepads, Zapper, Save States, Rewind & Expansion Audio
+
+### Input & Peripherals
+- **Plug-and-play USB / Bluetooth gamepads**: automatic hot-plug detection for Player 1
+  and Player 2 controllers via `gilrs` (`evdev`/`udev` on Linux, `XInput`/`RawInput` on
+  Windows) polled on a dedicated **1000 Hz (1 ms) background thread** (`lockstep-pad`), full
+  ROM-browser navigation from the pad, toast notifications on connect / disconnect, and F9 /
+  `LOCKSTEP_PAD_SWAP=1` for Nintendo A/B button labels.
+- **NES Zapper light-gun emulation** (`$4017` bits 3 and 4): mouse cursor aim + left/right click
+  trigger with dot-accurate CRT beam and phosphor-persistence luminance sensing (*Duck Hunt*,
+  *Wild Gunman*, *Hogan's Alley*, *Gumshoe*, etc.).
+
+### Save States, Rewind & Gameplay Controls
+- **Persistent 9-slot disk save states**: keys `1`–`9` select slots 1–9; F5/F8 save and load
+  gzip-compressed bit-exact console snapshots (`<rom>.s1`..`<rom>.s9`) next to the ROM file
+  (with in-memory fallback).
+- **Real-time Rewind, Pause, Frame-Advance & Fast-Forward**: hold `Backspace` (or `Select + L1`)
+  to rewind up to 10 seconds of gameplay; press `P` to pause and `.` to advance frame-by-frame;
+  hold `` ` `` / `~` (or `Select + R1`) for 2x fast-forward.
+- **CRT Scanline & NTSC 4:3 Display Filter** (`F10`, or `LOCKSTEP_CRT=1`): cycles between pixel-exact
+  8:7, NTSC 4:3 pixel aspect ratio (`8:7` PAR), and CRT scanline + bezel mode.
+- **PNG Screenshots (`F12`)**: saves `<rom>_<frame>.png`.
+- **Game Genie & Raw Cheat Codes**: supports 6- and 8-letter Game Genie codes (`SXIOPO`, `ZEXPYGLA`)
+  and raw hex patches (`AAAA:VV`, `AAAA:CC:VV`), loaded automatically from `<rom>.cht` or
+  `LOCKSTEP_CHEATS`.
+
+### Mappers & Expansion Audio
+- **New Mappers**: added **Konami VRC6a / VRC6b** (Mappers 24 & 26) and **Namco 163 / 129** (Mapper 19).
+- **Expansion Audio**: implemented **MMC5** (two expansion pulse channels + 8-bit PCM DAC and IRQ),
+  **Konami VRC6** (two 16-step variable-duty pulse channels + 6-bit sawtooth), **Namco 163**
+  (1–8 channel wavetable synthesizer), and **Sunsoft 5B / FME-7** (3-channel YM2149F tone + noise
+  PSG with logarithmic DAC).
+
+### Cross-Platform & CI
+- **Windows support**: portable monotonic nanosecond clock (`QueryPerformanceCounter` via
+  `std::time::Instant`), 1 ms multimedia timer period (`timeBeginPeriod(1)`), high-priority
+  emulation (`THREAD_PRIORITY_HIGHEST`) and audio (`THREAD_PRIORITY_TIME_CRITICAL`) threads,
+  and spin-assisted deadline sleeping on non-RT OSes.
+- **GitHub Actions CI & Release workflow**: automated Linux and Windows builds, tests, and
+  release archive packaging on tags.
+
 ## 0.3.0 — Lockstep
 
 The project was renamed from `nes-rt-emu` to **Lockstep** and licensed under the
@@ -16,28 +57,6 @@ The project was renamed from `nes-rt-emu` to **Lockstep** and licensed under the
   and verified bit-exact by a test.
 - **Late input sampling**: the controller state is read when the game strobes `$4016`
   (both Player 1 and Player 2). Opposing D-pad directions are filtered.
-- **Plug-and-play USB / Bluetooth gamepads**: automatic hot-plug detection for Player 1
-  and Player 2 controllers via `gilrs` (`evdev`/`udev` on Linux, `XInput`/`RawInput` on
-  Windows) polled on a dedicated **1000 Hz (1 ms) background thread** (`lockstep-pad`), full
-  ROM-browser navigation from the pad, toast notifications on connect / disconnect, and F9 /
-  `LOCKSTEP_PAD_SWAP=1` for Nintendo A/B button labels.
-- **Persistent 9-slot disk save states**: keys `1`–`9` select slots 1–9; F5/F8 save and load
-  gzip-compressed bit-exact console snapshots (`<rom>.s1`..`<rom>.s9`) next to the ROM file
-  (with in-memory fallback).
-- **NES Zapper light-gun emulation** (`$4017` bits 3 and 4): mouse cursor aim + left/right click
-  trigger with dot-accurate CRT beam and phosphor-persistence luminance sensing (*Duck Hunt*,
-  *Wild Gunman*, *Hogan's Alley*, *Gumshoe*, etc.).
-- **Real-time Rewind, Pause, Frame-Advance & Fast-Forward**: hold `Backspace` (or `Select + L1`)
-  to rewind up to 10 seconds of gameplay; press `P` to pause and `.` to advance frame-by-frame;
-  hold `` ` `` / `~` (or `Select + R1`) for 2x fast-forward.
-- **CRT Scanline & NTSC 4:3 Display Filter** (`F10`, or `LOCKSTEP_CRT=1`): cycles between pixel-exact
-  8:7, NTSC 4:3 pixel aspect ratio (`8:7` PAR), and CRT scanline + bezel mode.
-- **Expansion Audio**: implemented **MMC5** (two expansion pulse channels + 8-bit PCM DAC and IRQ)
-  and **Sunsoft 5B / FME-7** (3-channel YM2149F tone + noise PSG with logarithmic DAC).
-- **Windows support**: portable monotonic nanosecond clock (`QueryPerformanceCounter` via
-  `std::time::Instant`), 1 ms multimedia timer period (`timeBeginPeriod(1)`), high-priority
-  emulation (`THREAD_PRIORITY_HIGHEST`) and audio (`THREAD_PRIORITY_TIME_CRITICAL`) threads,
-  and spin-assisted deadline sleeping on non-RT OSes.
 - **New audio backend**: direct ALSA/PipeWire output through `cpal`, a lock-free ring
   buffer, PI dynamic rate control (±1.5 %) with anti-windup and a self-tuning buffer
   target, an underrun fade-out, and a SCHED_FIFO audio thread. Replaces the `paplay`

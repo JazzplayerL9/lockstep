@@ -13,8 +13,10 @@ mod mmc1;
 mod mmc2;
 mod mmc3;
 mod mmc5;
+mod n163;
 mod nrom;
 mod uxrom;
+mod vrc6;
 
 use std::sync::Arc;
 
@@ -563,7 +565,10 @@ impl Clone for Box<dyn Mapper> {
 
 /// Mapper numbers this emulator implements.
 pub fn is_supported(mapper_id: u16) -> bool {
-    matches!(mapper_id, 0 | 1 | 2 | 3 | 4 | 5 | 7 | 9 | 10 | 11 | 13 | 34 | 47 | 66 | 69 | 71 | 79 | 105 | 118 | 119 | 206)
+    matches!(
+        mapper_id,
+        0 | 1 | 2 | 3 | 4 | 5 | 7 | 9 | 10 | 11 | 13 | 19 | 24 | 26 | 34 | 47 | 66 | 69 | 71 | 79 | 105 | 118 | 119 | 206
+    )
 }
 
 /// Instantiates the board emulation for `cart`, or explains why it isn't supported.
@@ -583,6 +588,9 @@ pub fn create_mapper(cart: &Cartridge) -> Result<Box<dyn Mapper>, String> {
         10 => Box::new(mmc2::Mmc2::new(base, true)),
         11 | 66 | 34 | 79 => Box::new(gxrom::GxRom::new(base)),
         13 => Box::new(cprom::CpRom::new(base)),
+        19 => Box::new(n163::Namco163::new(base)),
+        24 => Box::new(vrc6::Vrc6::new(base, false)),
+        26 => Box::new(vrc6::Vrc6::new(base, true)),
         69 => Box::new(fme7::Fme7::new(base)),
         other => return Err(format!("Unsupported mapper {}", other)),
     };

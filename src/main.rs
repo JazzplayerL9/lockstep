@@ -704,10 +704,10 @@ async fn run() {
                     (-1, -1)
                 };
                 if is_mouse_button_pressed(MouseButton::Left) {
-                    shared.update_zapper(nes_x, nes_y, 4);
+                    shared.update_zapper(nes_x, nes_y, 2);
                     zapper_reticle_timer = 3.0;
                 } else if is_mouse_button_pressed(MouseButton::Right) {
-                    shared.update_zapper(-1, -1, 4);
+                    shared.update_zapper(-1, -1, 2);
                     zapper_reticle_timer = 3.0;
                 } else {
                     shared.update_zapper(nes_x, nes_y, 0);

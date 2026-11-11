@@ -1132,7 +1132,7 @@ impl Ppu {
                 continue;
             }
             for px in x0..=x1 {
-                if py == self.scanline && px > self.cycle as i32 {
+                if py == self.scanline && px >= self.cycle as i32 {
                     continue;
                 }
                 let raw = self.pixels[(py as usize) * SCREEN_WIDTH + (px as usize)];

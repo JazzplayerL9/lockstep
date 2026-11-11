@@ -14,11 +14,13 @@ use std::sync::atomic::Ordering;
 use macroquad::prelude::*;
 use lockstep_core::cartridge::Cartridge;
 use lockstep_core::input::{
-    BTN_A, BTN_B, BTN_DOWN, BTN_LEFT, BTN_RIGHT, BTN_SELECT, BTN_START, BTN_UP, GamepadHub,
+    BTN_A, BTN_B, BTN_DOWN, BTN_LEFT, BTN_RIGHT, BTN_SELECT, BTN_START, BTN_UP,
 };
 use lockstep_core::mappers;
 use lockstep_core::ppu::{SCREEN_HEIGHT, SCREEN_WIDTH};
-use lockstep_core::rt::{DisplayClock, EmulatorCommand, RtSharedState, spawn_emulator_worker};
+use lockstep_core::rt::{
+    DisplayClock, EmulatorCommand, RtSharedState, spawn_emulator_worker, spawn_gamepad_poller,
+};
 
 /// Picks the directory the ROM browser opens in, in order of preference:
 /// 1. the command-line argument (a directory, or the directory of a ROM file),
@@ -347,8 +349,10 @@ KEYS & GAMEPADS:
     Arrows / WASD   D-pad          Z / J / Space   A
     X / K / LShift  B              Enter           Start
     RShift / Tab    Select         R               Reset
+    1 - 9           Select save-state slot (1-9, persisted as <rom>.s1..<rom>.s9)
+    Mouse L / R     Zapper light-gun aim + fire / off-screen shot (Port 2)
     Esc / F1  ROM browser   F2 Unload   F3 RT scheduling   F4 Overclock
-    F5 / F8   Save / load state   F6 Overscan crop   F7 Run-ahead   F11 Fullscreen
+    F5 / F8   Save / load state   F6 Overscan crop   F7 Run-ahead   F9 Pad A/B swap   F11 Fullscreen
 
 See README.md and docs/ for details.";
 
@@ -380,7 +384,11 @@ fn main() {
 async fn run() {
     let shared = Arc::new(RtSharedState::new());
     shared.register_ui_thread();
+    shared
+        .pad_swap_ab
+        .store(env::var_os("LOCKSTEP_PAD_SWAP").is_some(), Ordering::Relaxed);
     let (cmd_tx, _worker_handle) = spawn_emulator_worker(Arc::clone(&shared));
+    let _pad_handle = spawn_gamepad_poller(Arc::clone(&shared));
 
     let mut image = Image {
         bytes: vec![0; SCREEN_WIDTH * SCREEN_HEIGHT * 4],
@@ -429,7 +437,8 @@ async fn run() {
     let mut display_clock = DisplayClock::new();
     let mut last_drawn_seq = 0u64;
     let mut fullscreen = false;
-    let mut gamepad_hub = GamepadHub::new();
+    let mut state_slot: u8 = 1;
+    let mut zapper_reticle_timer = 0.0f64;
 
     loop {
         let now = get_time();
@@ -438,15 +447,22 @@ async fn run() {
         if toast_timer > 0.0 {
             toast_timer = (toast_timer - dt).max(0.0);
         }
+        if zapper_reticle_timer > 0.0 {
+            zapper_reticle_timer = (zapper_reticle_timer - dt).max(0.0);
+        }
 
-        let pad = gamepad_hub.poll();
-        for note in pad.notifications {
+        for note in shared.drain_toasts() {
             toast_text = note;
             toast_timer = 3.0;
         }
+        let pad_held = shared.pad_buttons_held.load(Ordering::Acquire);
+        let pad_pressed = shared.pad_browser_pressed.swap(0, Ordering::AcqRel);
+        let pad_page_up = shared.pad_page_up.load(Ordering::Relaxed);
+        let pad_page_down = shared.pad_page_down.load(Ordering::Relaxed);
+        let pad_toggle_browser = shared.pad_toggle_browser.swap(false, Ordering::AcqRel);
 
         // Global Hotkeys (keyboard or gamepad Guide / Select+Start chord)
-        if is_key_pressed(KeyCode::F1) || is_key_pressed(KeyCode::Escape) || pad.toggle_browser {
+        if is_key_pressed(KeyCode::F1) || is_key_pressed(KeyCode::Escape) || pad_toggle_browser {
             if shared.rom_loaded.load(Ordering::Acquire) {
                 show_browser = !show_browser;
                 if show_browser {
@@ -492,16 +508,41 @@ async fn run() {
             toast_timer = 3.0;
         }
 
+        for (slot, key) in [
+            (1u8, KeyCode::Key1),
+            (2, KeyCode::Key2),
+            (3, KeyCode::Key3),
+            (4, KeyCode::Key4),
+            (5, KeyCode::Key5),
+            (6, KeyCode::Key6),
+            (7, KeyCode::Key7),
+            (8, KeyCode::Key8),
+            (9, KeyCode::Key9),
+        ] {
+            if is_key_pressed(key) {
+                state_slot = slot;
+                toast_text = format!("Save State Slot {} selected", state_slot);
+                toast_timer = 1.5;
+            }
+        }
+
         if is_key_pressed(KeyCode::F5) && shared.rom_loaded.load(Ordering::Acquire) {
-            let _ = cmd_tx.send(EmulatorCommand::SaveState);
-            toast_text = "State Saved (Slot 1)".to_string();
-            toast_timer = 2.0;
+            let _ = cmd_tx.send(EmulatorCommand::SaveState(state_slot));
         }
 
         if is_key_pressed(KeyCode::F8) && shared.rom_loaded.load(Ordering::Acquire) {
-            let _ = cmd_tx.send(EmulatorCommand::LoadState);
-            toast_text = "State Loaded (Slot 1)".to_string();
-            toast_timer = 2.0;
+            let _ = cmd_tx.send(EmulatorCommand::LoadState(state_slot));
+        }
+
+        if is_key_pressed(KeyCode::F9) {
+            let next_swap = !shared.pad_swap_ab.load(Ordering::Relaxed);
+            shared.pad_swap_ab.store(next_swap, Ordering::Relaxed);
+            toast_text = if next_swap {
+                "Gamepad A/B Layout: Swapped (East=A, South=B)".to_string()
+            } else {
+                "Gamepad A/B Layout: Default (South=A, West=B)".to_string()
+            };
+            toast_timer = 2.5;
         }
 
         if is_key_pressed(KeyCode::F7) {
@@ -526,21 +567,20 @@ async fn run() {
         }
 
         if show_browser {
-            // Pause controller input to the game while browsing files
+            // Pause keyboard input to the game while browsing files
             shared.update_input(0, 0);
-            shared.update_input_p2(0, 0);
 
             let n = browser.entries.len();
-            let up_down = is_key_down(KeyCode::Up) || (pad.p1_held & BTN_UP != 0);
-            let down_down = is_key_down(KeyCode::Down) || (pad.p1_held & BTN_DOWN != 0);
+            let up_down = is_key_down(KeyCode::Up) || (pad_held & BTN_UP != 0);
+            let down_down = is_key_down(KeyCode::Down) || (pad_held & BTN_DOWN != 0);
             let pgup_down = is_key_down(KeyCode::PageUp)
                 || is_key_down(KeyCode::Left)
-                || (pad.p1_held & BTN_LEFT != 0)
-                || pad.p1_page_up;
+                || (pad_held & BTN_LEFT != 0)
+                || pad_page_up;
             let pgdn_down = is_key_down(KeyCode::PageDown)
                 || is_key_down(KeyCode::Right)
-                || (pad.p1_held & BTN_RIGHT != 0)
-                || pad.p1_page_down;
+                || (pad_held & BTN_RIGHT != 0)
+                || pad_page_down;
 
             if rep_up.fire(up_down, dt) && browser.selected > 0 {
                 browser.selected -= 1;
@@ -560,7 +600,7 @@ async fn run() {
             if is_key_pressed(KeyCode::End) && !browser.entries.is_empty() {
                 browser.selected = browser.entries.len() - 1;
             }
-            if (is_key_pressed(KeyCode::Backspace) || (pad.p1_pressed & BTN_B != 0))
+            if (is_key_pressed(KeyCode::Backspace) || (pad_pressed & BTN_B != 0))
                 && let Some(parent) = browser.current_dir.parent()
             {
                 browser.current_dir = parent.to_path_buf();
@@ -568,7 +608,7 @@ async fn run() {
                 browser.refresh();
             }
             if (is_key_pressed(KeyCode::Enter)
-                || (pad.p1_pressed & (BTN_A | BTN_START) != 0 && !pad.toggle_browser))
+                || (pad_pressed & (BTN_A | BTN_START) != 0 && !pad_toggle_browser))
                 && let Some(item) = browser.entries.get(browser.selected).cloned()
             {
                 if item.is_dir {
@@ -599,10 +639,9 @@ async fn run() {
                 toast_text = "NES Reset".to_string();
                 toast_timer = 1.5;
             }
-            let held = poll_joypad_buttons() | pad.p1_held;
-            let pressed = poll_joypad_pressed() | pad.p1_pressed;
+            let held = poll_joypad_buttons();
+            let pressed = poll_joypad_pressed();
             shared.update_input(held, pressed);
-            shared.update_input_p2(pad.p2_held, pad.p2_pressed);
         }
 
         // Display sync: wait (bounded) for the frame the worker is producing just in
@@ -650,6 +689,38 @@ async fn run() {
                     ..Default::default()
                 },
             );
+
+            if !show_browser {
+                let (mx, my) = mouse_position();
+                let rel_x = (mx - draw_x) / draw_w.max(1.0);
+                let rel_y = (my - draw_y) / draw_h.max(1.0);
+                let in_bounds = (0.0..1.0).contains(&rel_x) && (0.0..1.0).contains(&rel_y);
+                let (nes_x, nes_y) = if in_bounds {
+                    (
+                        (src.x + rel_x * src.w) as i32,
+                        (src.y + rel_y * src.h) as i32,
+                    )
+                } else {
+                    (-1, -1)
+                };
+                if is_mouse_button_pressed(MouseButton::Left) {
+                    shared.update_zapper(nes_x, nes_y, 4);
+                    zapper_reticle_timer = 3.0;
+                } else if is_mouse_button_pressed(MouseButton::Right) {
+                    shared.update_zapper(-1, -1, 4);
+                    zapper_reticle_timer = 3.0;
+                } else {
+                    shared.update_zapper(nes_x, nes_y, 0);
+                }
+                if zapper_reticle_timer > 0.0 && in_bounds {
+                    let c = Color::new(1.0, 0.25, 0.25, 0.85);
+                    draw_circle_lines(mx, my, 9.0, 1.5, c);
+                    draw_line(mx - 14.0, my, mx - 4.0, my, 1.5, c);
+                    draw_line(mx + 4.0, my, mx + 14.0, my, 1.5, c);
+                    draw_line(mx, my - 14.0, mx, my - 4.0, 1.5, c);
+                    draw_line(mx, my + 4.0, mx, my + 14.0, 1.5, c);
+                }
+            }
         }
 
         // Brief notification after an action (load, save state, toggles...), sized to fit.
@@ -702,13 +773,19 @@ async fn run() {
             } else {
                 shared.caps.kernel_release.clone()
             };
+            let pad_summary = shared
+                .pad_status
+                .lock()
+                .map(|s| s.clone())
+                .unwrap_or_default();
             draw_text(
                 &fit_text(
                     &format!(
-                        "{}  |  {}  |  {}",
+                        "{}  |  Slot {}  |  {}  |  {}",
                         current_rom_info,
+                        state_slot,
                         host_info,
-                        gamepad_hub.status_summary()
+                        pad_summary
                     ),
                     text_w,
                     16,
@@ -793,7 +870,7 @@ async fn run() {
                 help,
             );
             draw_text(
-                &fit_text("Esc/F1: Game  F2: Unload  F3: RT  F4: Overclock  F5/F8: State  F6: Crop  F7: Run-ahead  F11: Fullscreen  R: Reset", text_w, 15),
+                &fit_text("Esc/F1: Game  F2: Unload  F3: RT  F4: Overclock  1-9: Slot  F5/F8: Save/Load  F6: Crop  F7: Run-ahead  F9: Pad A/B  F11: Full", text_w, 15),
                 panel_x + 18.0,
                 footer_y,
                 15.0,

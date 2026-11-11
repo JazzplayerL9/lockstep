@@ -36,7 +36,7 @@ pub struct Mmc5 {
     /// `ppu_write` decode them from `nt_mapping`.
     base: CartBase,
     /// 1 KB internal ExRAM, CPU-visible at $5C00-$5FFF.
-    exram: Vec<u8>,
+    exram: [u8; 0x400],
     /// Snooped copy of PPUCTRL ($2000); bit 5 (8x16 sprites) enables the separate
     /// BG/sprite CHR sets.
     ppu_ctrl: u8,
@@ -143,7 +143,7 @@ impl Mmc5 {
     pub fn new(base: CartBase) -> Self {
         let mut m = Self {
             base,
-            exram: vec![0; 0x400],
+            exram: [0; 0x400],
             ppu_ctrl: 0,
             prg_mode: 3,
             chr_mode: 0,

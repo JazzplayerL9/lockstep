@@ -125,11 +125,12 @@ compatibility test above, except where noted.
 - DMC "sample duplication" glitches of later CPU revisions are not modelled.
 
 **Input**
-- Only standard controllers are supported. The **Zapper** (Duck Hunt, Hogan's Alley,
-  Wild Gunman, the Duck Hunt half of combo carts), **Power Pad** (Stadium Events, World
-  Class Track Meet), **Arkanoid Vaus paddle**, **Miracle Piano** keyboard, **Four Score**
-  and R.O.B. are not emulated. Those games boot but can't be played (or only partly).
-- Player 2 has no default key binding yet.
+- Standard controllers (Player 1 and Player 2 via keyboard and 1000 Hz plug-and-play
+  USB/Bluetooth gamepads) and the **NES Zapper light gun** (`$4017` bits 3 and 4, with
+  dot-level CRT scanline/phosphor-decay light detection for *Duck Hunt*, *Wild Gunman*,
+  *Hogan's Alley*, *Gumshoe*, etc.) are supported. The **Power Pad** (Stadium Events,
+  World Class Track Meet), **Arkanoid Vaus paddle**, **Miracle Piano** keyboard,
+  **Four Score** and R.O.B. are not emulated.
 
 **Mappers**
 - NES-EVENT (Nintendo World Championships 1990) uses a fixed DIP-switch setting

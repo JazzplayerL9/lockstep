@@ -65,12 +65,73 @@ pub struct Joypad {
     /// Strobe (bit 0 of the last $4016 write). While set, the shift registers are held
     /// loaded and reads always return the current A button.
     strobe: bool,
+    /// Whether the NES Zapper light gun is active on controller port 2 (`$4017` bits 3 and 4).
+    pub zapper_connected: bool,
+    /// Current Zapper aim X coordinate in NES pixels (`0..256`, or `-1` when aimed off-screen).
+    pub zapper_x: i32,
+    /// Current Zapper aim Y coordinate in NES pixels (`0..240`, or `-1` when aimed off-screen).
+    pub zapper_y: i32,
+    /// Remaining frames for which the Zapper trigger switch (`$4017` bit 4) is held active (`0` = released).
+    pub zapper_trigger_frames: u8,
 }
 
 impl Joypad {
     /// Both controllers idle.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            zapper_x: -1,
+            zapper_y: -1,
+            ..Self::default()
+        }
+    }
+
+    /// Updates Zapper aim coordinates (`0..256`, `0..240`, or `-1` for off-screen) and optional trigger pull.
+    pub fn set_zapper(&mut self, x: i32, y: i32, trigger_frames: u8) {
+        self.zapper_x = x;
+        self.zapper_y = y;
+        if trigger_frames > 0 {
+            self.zapper_connected = true;
+            self.zapper_trigger_frames = trigger_frames;
+        }
+    }
+
+    /// Advances the Zapper trigger hold counter by one frame (called once per VBlank).
+    pub fn step_zapper_frame(&mut self) {
+        if self.zapper_trigger_frames > 0 {
+            self.zapper_trigger_frames -= 1;
+        }
+    }
+
+    /// Serializes controller shift-register and Zapper state into `out`.
+    pub fn save_state(&self, out: &mut Vec<u8>) {
+        out.push(self.buttons_p1);
+        out.push(self.buttons_p2);
+        out.push(self.shift_p1);
+        out.push(self.shift_p2);
+        out.push(self.strobe as u8);
+        out.push(self.zapper_connected as u8);
+        out.extend_from_slice(&self.zapper_x.to_le_bytes());
+        out.extend_from_slice(&self.zapper_y.to_le_bytes());
+        out.push(self.zapper_trigger_frames);
+    }
+
+    /// Restores controller shift-register and Zapper state from `cur`.
+    pub fn load_state(&mut self, cur: &mut &[u8]) -> Result<(), String> {
+        if cur.len() < 15 {
+            return Err("Truncated save state (Joypad)".into());
+        }
+        let (b, rest) = cur.split_at(15);
+        *cur = rest;
+        self.buttons_p1 = b[0];
+        self.buttons_p2 = b[1];
+        self.shift_p1 = b[2];
+        self.shift_p2 = b[3];
+        self.strobe = b[4] != 0;
+        self.zapper_connected = b[5] != 0;
+        self.zapper_x = i32::from_le_bytes(b[6..10].try_into().unwrap());
+        self.zapper_y = i32::from_le_bytes(b[10..14].try_into().unwrap());
+        self.zapper_trigger_frames = b[14];
+        Ok(())
     }
 
     /// Player 1 frame-start buttons OR'd with the live state; opposing D-pad directions are
@@ -157,7 +218,7 @@ pub struct GamepadHub {
     /// Whether `Select+Start` was already held on the previous poll (so the browser toggle fires once).
     prev_chord_toggle: bool,
     /// When true (`LOCKSTEP_PAD_SWAP=1`), swaps South and East face buttons (Nintendo A/B layout).
-    swap_ab: bool,
+    pub swap_ab: bool,
 }
 
 impl Default for GamepadHub {

@@ -59,6 +59,7 @@ struct SpriteInfo {
 /// Advanced dot-by-dot (341 dots x 262 scanlines per NTSC frame) by [`Ppu::run`], which the
 /// CPU calls twice per CPU cycle with the shared master clock. Field naming follows the
 /// nesdev wiki ("Loopy" `v`/`t`/`x`/`w` scroll registers).
+#[repr(C)]
 #[derive(Clone)]
 pub struct Ppu {
     /// Current dot within the scanline (0-340).
@@ -1110,5 +1111,100 @@ impl Ppu {
             }
             self.need_state_update = true;
         }
+    }
+
+    /// Returns `true` when the Zapper photodiode aimed at `(zap_x, zap_y)` senses CRT beam light
+    /// at the current PPU scanline/dot (including the ~24-scanline phosphor persistence window).
+    pub fn zapper_sees_light(&self, zap_x: i32, zap_y: i32) -> bool {
+        if !(0..256).contains(&zap_x) || !(0..240).contains(&zap_y) {
+            return false;
+        }
+        if !(0..240).contains(&self.scanline) {
+            return false;
+        }
+        let lut = crate::palette::rgba_table();
+        let y0 = (zap_y - 3).max(0);
+        let y1 = (zap_y + 3).min(239);
+        let x0 = (zap_x - 3).max(0);
+        let x1 = (zap_x + 3).min(255);
+        for py in y0..=y1 {
+            if py > self.scanline || self.scanline - py > 24 {
+                continue;
+            }
+            for px in x0..=x1 {
+                if py == self.scanline && px > self.cycle as i32 {
+                    continue;
+                }
+                let raw = self.pixels[(py as usize) * SCREEN_WIDTH + (px as usize)];
+                let rgba = lut[(raw & 0x1FF) as usize].to_le_bytes();
+                let luma = rgba[0] as u32 + rgba[1] as u32 + rgba[2] as u32;
+                if luma >= 350 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Serializes the PPU state into `out`.
+    pub fn save_state(&self, out: &mut Vec<u8>) {
+        let pod_len = std::mem::offset_of!(Self, pixels);
+        out.extend_from_slice(&(pod_len as u32).to_le_bytes());
+        // SAFETY: All fields of `Ppu` before `pixels` are plain-old-data (`Copy`).
+        let pod = unsafe { std::slice::from_raw_parts(self as *const Self as *const u8, pod_len) };
+        out.extend_from_slice(pod);
+        // Save the in-progress 9-bit `pixels` buffer so mid-frame save states are bit-exact.
+        let px_bytes = unsafe {
+            std::slice::from_raw_parts(
+                self.pixels.as_ptr() as *const u8,
+                self.pixels.len() * std::mem::size_of::<u16>(),
+            )
+        };
+        out.extend_from_slice(&(px_bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(px_bytes);
+    }
+
+    /// Restores the PPU state from `cur`.
+    pub fn load_state(&mut self, cur: &mut &[u8]) -> Result<(), String> {
+        let pod_len = std::mem::offset_of!(Self, pixels);
+        if cur.len() < 4 {
+            return Err("Truncated save state (PPU header)".into());
+        }
+        let (len_b, rest) = cur.split_at(4);
+        *cur = rest;
+        let saved_pod = u32::from_le_bytes(len_b.try_into().unwrap()) as usize;
+        if saved_pod != pod_len || cur.len() < pod_len {
+            return Err("PPU state size mismatch".into());
+        }
+        let (pod, rest2) = cur.split_at(pod_len);
+        *cur = rest2;
+        // SAFETY: All fields before `pixels` are plain-old-data.
+        unsafe {
+            std::ptr::copy_nonoverlapping(pod.as_ptr(), self as *mut Self as *mut u8, pod_len);
+        }
+        if cur.len() < 4 {
+            return Err("Truncated save state (PPU pixels)".into());
+        }
+        let (plen_b, rest3) = cur.split_at(4);
+        *cur = rest3;
+        let px_byte_len = u32::from_le_bytes(plen_b.try_into().unwrap()) as usize;
+        let expected_px_bytes = self.pixels.len() * std::mem::size_of::<u16>();
+        if px_byte_len != expected_px_bytes || cur.len() < expected_px_bytes {
+            return Err("PPU pixel buffer size mismatch".into());
+        }
+        let (px_data, rest4) = cur.split_at(expected_px_bytes);
+        *cur = rest4;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                px_data.as_ptr(),
+                self.pixels.as_mut_ptr() as *mut u8,
+                expected_px_bytes,
+            );
+        }
+        let lut = crate::palette::rgba_table();
+        for (px, &p) in self.framebuffer.chunks_exact_mut(4).zip(self.pixels.iter()) {
+            px.copy_from_slice(&lut[(p & 0x1FF) as usize].to_le_bytes());
+        }
+        Ok(())
     }
 }

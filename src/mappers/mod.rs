@@ -317,6 +317,87 @@ impl CartBase {
             self.write_nt(addr, val)
         }
     }
+
+    /// Appends the mutable cartridge base state (`chr_ram`, `prg_ram`, `ciram`, banking slots, mirroring) to `out`.
+    pub fn save_base_state(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.mapper_id.to_le_bytes());
+        out.extend_from_slice(&self.crc32.to_le_bytes());
+        for buf in [&self.chr_ram, &self.prg_ram, &self.ciram] {
+            out.extend_from_slice(&(buf.len() as u32).to_le_bytes());
+            out.extend_from_slice(buf);
+        }
+        let banking = CartBaseBanking {
+            prg: self.prg,
+            chr: self.chr,
+            nt: self.nt,
+            mirroring: self.mirroring,
+        };
+        // SAFETY: `CartBaseBanking` is `Copy` plain-old-data read in-process by the same binary.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                &banking as *const CartBaseBanking as *const u8,
+                std::mem::size_of::<CartBaseBanking>(),
+            )
+        };
+        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(bytes);
+    }
+
+    /// Restores the mutable cartridge base state from `cur`.
+    pub fn load_base_state(&mut self, cur: &mut &[u8]) -> Result<(), String> {
+        let take = |cur: &mut &[u8], n: usize| -> Result<Vec<u8>, String> {
+            if cur.len() < n {
+                return Err("Truncated save state (CartBase)".into());
+            }
+            let (head, tail) = cur.split_at(n);
+            *cur = tail;
+            Ok(head.to_vec())
+        };
+        let mapper_id = u16::from_le_bytes(take(cur, 2)?.try_into().unwrap());
+        let crc32 = u32::from_le_bytes(take(cur, 4)?.try_into().unwrap());
+        if mapper_id != self.mapper_id || crc32 != self.crc32 {
+            return Err(format!(
+                "Save state ROM mismatch (expected mapper {} crc {:08X}, got mapper {} crc {:08X})",
+                self.mapper_id, self.crc32, mapper_id, crc32
+            ));
+        }
+        for buf in [&mut self.chr_ram, &mut self.prg_ram, &mut self.ciram] {
+            let len = u32::from_le_bytes(take(cur, 4)?.try_into().unwrap()) as usize;
+            if len != buf.len() {
+                return Err(format!("Save state RAM size mismatch ({} vs {})", len, buf.len()));
+            }
+            let data = take(cur, len)?;
+            buf.copy_from_slice(&data);
+        }
+        let b_len = u32::from_le_bytes(take(cur, 4)?.try_into().unwrap()) as usize;
+        if b_len != std::mem::size_of::<CartBaseBanking>() {
+            return Err("Save state CartBaseBanking size mismatch".into());
+        }
+        let b_bytes = take(cur, b_len)?;
+        // SAFETY: `CartBaseBanking` is `Copy` and size was verified above.
+        let banking: CartBaseBanking = unsafe {
+            std::ptr::read_unaligned(b_bytes.as_ptr() as *const CartBaseBanking)
+        };
+        self.prg = banking.prg;
+        self.chr = banking.chr;
+        self.nt = banking.nt;
+        self.mirroring = banking.mirroring;
+        Ok(())
+    }
+}
+
+/// Snapshot of `CartBase`'s bank-mapping tables and mirroring mode.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CartBaseBanking {
+    /// CPU $6000-$FFFF 8 KB slots.
+    prg: [PrgSlot; 5],
+    /// PPU $0000-$1FFF 1 KB slots.
+    chr: [(ChrKind, usize); 8],
+    /// Four nametable offsets into CIRAM.
+    nt: [usize; 4],
+    /// Current mirroring mode.
+    mirroring: Mirroring,
 }
 
 /// Bus interface every cartridge board implements.
@@ -397,15 +478,80 @@ pub trait Mapper: Send + MapperClone {
     }
 }
 
-/// Object-safe cloning for `Box<dyn Mapper>` (implemented automatically for every `Clone` mapper).
+/// Object-safe cloning and save-state serialization for `Box<dyn Mapper>` (implemented automatically for every `Clone` mapper).
 pub trait MapperClone {
     /// Clones the mapper into a new box (used by save states and run-ahead).
     fn box_clone(&self) -> Box<dyn Mapper>;
+    /// Serializes the mapper's mutable state (`CartBase` + board registers) into `out`.
+    fn save_mapper_state(&self, out: &mut Vec<u8>);
+    /// Deserializes the mapper's mutable state (`CartBase` + board registers) from `cur`.
+    fn load_mapper_state(&mut self, cur: &mut &[u8]) -> Result<(), String>;
 }
 
 impl<T: Mapper + Clone + 'static> MapperClone for T {
     fn box_clone(&self) -> Box<dyn Mapper> {
         Box::new(self.clone())
+    }
+
+    fn save_mapper_state(&self, out: &mut Vec<u8>) {
+        self.base().save_base_state(out);
+        let self_ptr = self as *const T as *const u8;
+        let base_ptr = self.base() as *const CartBase as *const u8;
+        let base_off = (base_ptr as usize) - (self_ptr as usize);
+        let base_end = base_off + std::mem::size_of::<CartBase>();
+        let total = std::mem::size_of::<T>();
+        let extra = total - std::mem::size_of::<CartBase>();
+        out.extend_from_slice(&(extra as u32).to_le_bytes());
+        // SAFETY: All mapper fields outside `base: CartBase` are plain-old-data (`Copy`).
+        unsafe {
+            if base_off > 0 {
+                out.extend_from_slice(std::slice::from_raw_parts(self_ptr, base_off));
+            }
+            if base_end < total {
+                out.extend_from_slice(std::slice::from_raw_parts(
+                    self_ptr.add(base_end),
+                    total - base_end,
+                ));
+            }
+        }
+    }
+
+    fn load_mapper_state(&mut self, cur: &mut &[u8]) -> Result<(), String> {
+        self.base_mut().load_base_state(cur)?;
+        if cur.len() < 4 {
+            return Err("Truncated save state (mapper header)".into());
+        }
+        let (len_bytes, rest) = cur.split_at(4);
+        *cur = rest;
+        let saved_extra = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+        let self_ptr = self as *mut T as *mut u8;
+        let base_ptr = self.base() as *const CartBase as *const u8;
+        let base_off = (base_ptr as usize) - (self_ptr as usize);
+        let base_end = base_off + std::mem::size_of::<CartBase>();
+        let total = std::mem::size_of::<T>();
+        let expected_extra = total - std::mem::size_of::<CartBase>();
+        if saved_extra != expected_extra || cur.len() < expected_extra {
+            return Err(format!(
+                "Mapper state size mismatch (expected {} bytes, got {})",
+                expected_extra, saved_extra
+            ));
+        }
+        let (data, tail) = cur.split_at(expected_extra);
+        *cur = tail;
+        // SAFETY: Only the plain-old-data bytes outside `base: CartBase` are overwritten.
+        unsafe {
+            if base_off > 0 {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), self_ptr, base_off);
+            }
+            if base_end < total {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr().add(base_off),
+                    self_ptr.add(base_end),
+                    total - base_end,
+                );
+            }
+        }
+        Ok(())
     }
 }
 

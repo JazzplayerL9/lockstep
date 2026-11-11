@@ -545,6 +545,7 @@ pub enum DmcDmaRequest {
 ///
 /// Clocked once per CPU cycle by [`crate::cpu::System`]. Produces mono `f32` samples at
 /// [`Apu::output_rate`] into [`Apu::audio_samples`], which the front end drains each frame.
+#[repr(C)]
 #[derive(Clone)]
 pub struct Apu {
     /// Pulse 1 ($4000-$4003).
@@ -1010,5 +1011,41 @@ impl Apu {
             }
             _ => {}
         }
+    }
+
+    /// Serializes the APU state into `out`.
+    pub fn save_state(&self, out: &mut Vec<u8>) {
+        let pod_len = std::mem::offset_of!(Self, audio_samples);
+        out.extend_from_slice(&(pod_len as u32).to_le_bytes());
+        // SAFETY: All fields of `Apu` before `audio_samples` are plain-old-data.
+        let pod = unsafe { std::slice::from_raw_parts(self as *const Self as *const u8, pod_len) };
+        out.extend_from_slice(pod);
+        out.extend_from_slice(&self.output_rate.to_le_bytes());
+        out.extend_from_slice(&self.expansion.to_le_bytes());
+    }
+
+    /// Restores the APU state from `cur`.
+    pub fn load_state(&mut self, cur: &mut &[u8]) -> Result<(), String> {
+        let pod_len = std::mem::offset_of!(Self, audio_samples);
+        if cur.len() < 4 {
+            return Err("Truncated save state (APU header)".into());
+        }
+        let (len_b, rest) = cur.split_at(4);
+        *cur = rest;
+        let saved_pod = u32::from_le_bytes(len_b.try_into().unwrap()) as usize;
+        if saved_pod != pod_len || cur.len() < pod_len + 12 {
+            return Err("APU state size mismatch".into());
+        }
+        let (pod, rest2) = cur.split_at(pod_len);
+        let (tail, rest3) = rest2.split_at(12);
+        *cur = rest3;
+        // SAFETY: All fields before `audio_samples` are plain-old-data.
+        unsafe {
+            std::ptr::copy_nonoverlapping(pod.as_ptr(), self as *mut Self as *mut u8, pod_len);
+        }
+        self.output_rate = f64::from_le_bytes(tail[0..8].try_into().unwrap());
+        self.expansion = f32::from_le_bytes(tail[8..12].try_into().unwrap());
+        self.audio_samples.clear();
+        Ok(())
     }
 }

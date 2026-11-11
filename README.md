@@ -51,7 +51,9 @@ lockstep "Super Mario Bros. 3 (USA).zip"
 - **Just-in-time frames**: emulation of each frame starts as late as possible so it
   finishes only ~4 ms before it is shown. The margin adapts to your compositor.
 - **Run-ahead** (0/1/2 frames) hides a game's own built-in input lag. It is verified frame-exact by a test.
-- **Late input sampling**: controller state is read at the instant the game strobes the pad.
+- **Late input sampling**: controller state is read at the instant the game strobes the pad,
+  fed by a dedicated **1000 Hz (1 ms) background gamepad polling thread** so controller changes
+  are captured even while the UI thread is blocked in vsync swap.
 - **Low-latency audio** via ALSA/PipeWire (Linux) or WASAPI (Windows) with a lock-free ring
   buffer and a PI-controlled dynamic rate control loop whose buffer target adapts to your
   sound server (10 ms on low-quantum setups, ~20–25 ms on default PipeWire/WASAPI); no drift,
@@ -64,11 +66,15 @@ lockstep "Super Mario Bros. 3 (USA).zip"
 
 **Convenience**
 - **Plug-and-play USB / Bluetooth gamepads** (Player 1 & Player 2) via `gilrs` (`evdev`/`udev`
-  on Linux, `XInput`/`RawInput` on Windows), with hot-plug notifications and full ROM-browser
-  navigation from the controller.
+  on Linux, `XInput`/`RawInput` on Windows) polled at 1000 Hz, with hot-plug notifications,
+  runtime A/B layout swap (F9), and full ROM-browser navigation from the controller.
+- **NES Zapper light-gun emulation** on controller port 2 (`$4017` bits 3 and 4): aim with the
+  mouse cursor, left-click to fire at the screen, right-click to fire off-screen (*Duck Hunt*,
+  *Wild Gunman*, *Hogan's Alley*, *Gumshoe*, etc.).
 - Loads `.nes`, NES 2.0 headers, `.zip` archives, and known **headerless** dumps.
 - Corrects known-bad iNES headers by CRC (wrong mapper, mirroring or battery flags).
-- Battery saves (`<rom>.sav`, written every ~10 s and on exit), instant save state, reset.
+- Battery saves (`<rom>.sav`, written every ~10 s and on exit), **9 persistent disk save-state
+  slots** (`<rom>.s1`..`<rom>.s9`, gzip-compressed), reset.
 - ROM browser with hold-to-scroll, overscan crop, fullscreen, optional "overclock".
 - **Cross-platform (Linux & Windows)**: full real-time `PREEMPT_RT` / `SCHED_FIFO` support on
   Linux; runs natively on Windows with `QueryPerformanceCounter` timing, 1 ms multimedia timer
@@ -164,15 +170,21 @@ directory.
 Pressing opposing directions at the same time (impossible on a real pad) is filtered, because
 some games crash on it.
 
+**Zapper light gun (Port 2)**: Move the mouse cursor over the NES screen to aim; **left-click**
+pulls the trigger at the cursor position (with CRT beam-position and phosphor-decay light
+detection on `$4017` bit 3), and **right-click** pulls the trigger aimed off-screen.
+
 | Hotkey | Function |
 |---|---|
 | Esc / F1 | Toggle the ROM browser |
 | F2 | Unload the cartridge |
-| F3 | Toggle real-time (SCHED_FIFO) scheduling |
+| F3 | Toggle real-time (`SCHED_FIFO` on Linux / High-Priority 1 ms on Windows) scheduling |
 | F4 | Toggle overclock (extra CPU time per frame; reduces slowdown in some games) |
-| F5 / F8 | Save / load state (one in-memory slot) |
+| 1 – 9 | Select active save-state slot (1–9) |
+| F5 / F8 | Save / load state to persistent disk file (`<rom>.s1`..`<rom>.s9`) |
 | F6 | Toggle 8-pixel overscan crop |
 | F7 | Cycle run-ahead: off → 1 frame → 2 frames |
+| F9 | Toggle gamepad A/B button layout swap (`South=A` vs `East=A`) |
 | F11 | Toggle fullscreen |
 | R | Reset the console |
 

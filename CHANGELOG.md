@@ -18,8 +18,15 @@ The project was renamed from `nes-rt-emu` to **Lockstep** and licensed under the
   (both Player 1 and Player 2). Opposing D-pad directions are filtered.
 - **Plug-and-play USB / Bluetooth gamepads**: automatic hot-plug detection for Player 1
   and Player 2 controllers via `gilrs` (`evdev`/`udev` on Linux, `XInput`/`RawInput` on
-  Windows), full ROM-browser navigation from the pad, toast notifications on connect /
-  disconnect, and `LOCKSTEP_PAD_SWAP=1` for Nintendo A/B button labels.
+  Windows) polled on a dedicated **1000 Hz (1 ms) background thread** (`lockstep-pad`), full
+  ROM-browser navigation from the pad, toast notifications on connect / disconnect, and F9 /
+  `LOCKSTEP_PAD_SWAP=1` for Nintendo A/B button labels.
+- **Persistent 9-slot disk save states**: keys `1`–`9` select slots 1–9; F5/F8 save and load
+  gzip-compressed bit-exact console snapshots (`<rom>.s1`..`<rom>.s9`) next to the ROM file
+  (with in-memory fallback).
+- **NES Zapper light-gun emulation** (`$4017` bits 3 and 4): mouse cursor aim + left/right click
+  trigger with dot-accurate CRT beam and phosphor-persistence luminance sensing (*Duck Hunt*,
+  *Wild Gunman*, *Hogan's Alley*, *Gumshoe*, etc.).
 - **Windows support**: portable monotonic nanosecond clock (`QueryPerformanceCounter` via
   `std::time::Instant`), 1 ms multimedia timer period (`timeBeginPeriod(1)`), high-priority
   emulation (`THREAD_PRIORITY_HIGHEST`) and audio (`THREAD_PRIORITY_TIME_CRITICAL`) threads,

@@ -52,10 +52,10 @@ pub enum EmulatorCommand {
     UnloadRom,
     /// Press the console's reset button.
     Reset,
-    /// Snapshot the whole machine into the (single, in-memory) state slot.
-    SaveState,
-    /// Restore the snapshot taken by `SaveState`.
-    LoadState,
+    /// Save the console state to persistent disk slot `1..=9` (`<rom>.s1`..`<rom>.s9`), with in-memory fallback.
+    SaveState(u8),
+    /// Restore the console state from persistent disk slot `1..=9` (`<rom>.s1`..`<rom>.s9`), or in-memory fallback.
+    LoadState(u8),
     /// Enable/disable the extra idle scanlines before VBlank.
     SetOverclock(bool),
     /// Switch the emulation thread between SCHED_FIFO and normal scheduling.
@@ -429,12 +429,36 @@ pub struct RtSharedState {
     pub framebuffer: TripleFramebuffer,
     /// Held Player 1 buttons, read by the emulated controller at strobe time.
     pub buttons_held: Arc<AtomicU8>,
+    /// Held keyboard Player 1 buttons (merged with `pad_buttons_held` into `buttons_held`).
+    pub kb_buttons_held: AtomicU8,
+    /// Held gamepad Player 1 buttons (updated at 1000 Hz by the gamepad polling thread).
+    pub pad_buttons_held: AtomicU8,
     /// Player 1 buttons pressed since the last emulated frame (so sub-frame taps aren't lost).
     pub buttons_latched: AtomicU8,
     /// Held Player 2 buttons, read by the emulated controller at strobe time.
     pub buttons_held_p2: Arc<AtomicU8>,
     /// Player 2 buttons pressed since the last emulated frame.
     pub buttons_latched_p2: AtomicU8,
+    /// Newly pressed gamepad buttons for UI ROM browser navigation (drained by the UI thread).
+    pub pad_browser_pressed: AtomicU8,
+    /// Left shoulder held on Player 1's gamepad (page-up in the ROM browser).
+    pub pad_page_up: AtomicBool,
+    /// Right shoulder held on Player 1's gamepad (page-down in the ROM browser).
+    pub pad_page_down: AtomicBool,
+    /// Guide/Mode button or Select+Start chord pressed to toggle the ROM browser.
+    pub pad_toggle_browser: AtomicBool,
+    /// Gamepad A/B face-button layout swap (`false` = South=A/West=B, `true` = East=A/South=B).
+    pub pad_swap_ab: AtomicBool,
+    /// Zapper light-gun aim X in NES pixels (`0..256`, or `-1` when off-screen).
+    pub zapper_x: AtomicI32,
+    /// Zapper light-gun aim Y in NES pixels (`0..240`, or `-1` when off-screen).
+    pub zapper_y: AtomicI32,
+    /// Latched Zapper trigger frames (`> 0` when the trigger was pulled since the last frame).
+    pub zapper_trigger: AtomicU8,
+    /// Latest human-readable gamepad status summary from the 1000 Hz poller thread.
+    pub pad_status: Mutex<String>,
+    /// Toast messages queued by worker/input threads for display on the HUD.
+    pub toasts: Mutex<Vec<String>>,
     /// Cleared to stop the worker.
     pub running: AtomicBool,
     /// A cartridge is inserted and running.
@@ -483,9 +507,21 @@ impl RtSharedState {
             caps,
             framebuffer: TripleFramebuffer::new(),
             buttons_held: Arc::new(AtomicU8::new(0)),
+            kb_buttons_held: AtomicU8::new(0),
+            pad_buttons_held: AtomicU8::new(0),
             buttons_latched: AtomicU8::new(0),
             buttons_held_p2: Arc::new(AtomicU8::new(0)),
             buttons_latched_p2: AtomicU8::new(0),
+            pad_browser_pressed: AtomicU8::new(0),
+            pad_page_up: AtomicBool::new(false),
+            pad_page_down: AtomicBool::new(false),
+            pad_toggle_browser: AtomicBool::new(false),
+            pad_swap_ab: AtomicBool::new(false),
+            zapper_x: AtomicI32::new(-1),
+            zapper_y: AtomicI32::new(-1),
+            zapper_trigger: AtomicU8::new(0),
+            pad_status: Mutex::new("No gamepad connected (plug-and-play ready)".to_string()),
+            toasts: Mutex::new(Vec::new()),
             running: AtomicBool::new(true),
             rom_loaded: AtomicBool::new(false),
             rt_mode_enabled: AtomicBool::new(default_rt),
@@ -510,7 +546,9 @@ impl RtSharedState {
     /// shorter than a frame still register.
     #[inline]
     pub fn update_input(&self, held_mask: u8, newly_pressed_mask: u8) {
-        self.buttons_held.store(held_mask, Ordering::Release);
+        self.kb_buttons_held.store(held_mask, Ordering::Release);
+        let pad = self.pad_buttons_held.load(Ordering::Acquire);
+        self.buttons_held.store(held_mask | pad, Ordering::Release);
         if newly_pressed_mask != 0 {
             self.buttons_latched.fetch_or(newly_pressed_mask, Ordering::AcqRel);
         }
@@ -522,6 +560,32 @@ impl RtSharedState {
         self.buttons_held_p2.store(held_mask, Ordering::Release);
         if newly_pressed_mask != 0 {
             self.buttons_latched_p2.fetch_or(newly_pressed_mask, Ordering::AcqRel);
+        }
+    }
+
+    /// UI thread: updates Zapper light-gun aim (`0..256`, `0..240`, or `-1` off-screen) and optional trigger pull.
+    #[inline]
+    pub fn update_zapper(&self, x: i32, y: i32, trigger_frames: u8) {
+        self.zapper_x.store(x, Ordering::Release);
+        self.zapper_y.store(y, Ordering::Release);
+        if trigger_frames > 0 {
+            self.zapper_trigger.store(trigger_frames, Ordering::Release);
+        }
+    }
+
+    /// Queues a HUD toast message from any thread.
+    pub fn push_toast(&self, msg: impl Into<String>) {
+        if let Ok(mut q) = self.toasts.lock() {
+            q.push(msg.into());
+        }
+    }
+
+    /// Drains all queued HUD toast messages on the UI thread.
+    pub fn drain_toasts(&self) -> Vec<String> {
+        if let Ok(mut q) = self.toasts.lock() {
+            std::mem::take(&mut *q)
+        } else {
+            Vec::new()
         }
     }
 
@@ -663,6 +727,51 @@ pub fn spawn_emulator_worker(shared: Arc<RtSharedState>) -> (Sender<EmulatorComm
     (cmd_tx, handle)
 }
 
+/// Spawns a dedicated 1000 Hz (1 ms) background thread that polls USB / Bluetooth gamepads
+/// independently of the UI thread's vsync loop, so `$4016` / `$4017` strobes always see
+/// sub-millisecond controller state.
+pub fn spawn_gamepad_poller(shared: Arc<RtSharedState>) -> JoinHandle<()> {
+    thread::Builder::new()
+        .name("lockstep-pad".to_string())
+        .spawn(move || {
+            let mut hub = crate::input::GamepadHub::new();
+            let mut init_poll = hub.poll();
+            if let Ok(mut st) = shared.pad_status.lock() {
+                *st = hub.status_summary();
+            }
+            for note in init_poll.notifications.drain(..) {
+                shared.push_toast(note);
+            }
+            while shared.running.load(Ordering::Acquire) {
+                hub.swap_ab = shared.pad_swap_ab.load(Ordering::Relaxed);
+                let poll = hub.poll();
+                shared.pad_buttons_held.store(poll.p1_held, Ordering::Release);
+                let kb = shared.kb_buttons_held.load(Ordering::Acquire);
+                shared.buttons_held.store(kb | poll.p1_held, Ordering::Release);
+                if poll.p1_pressed != 0 {
+                    shared.buttons_latched.fetch_or(poll.p1_pressed, Ordering::AcqRel);
+                    shared.pad_browser_pressed.fetch_or(poll.p1_pressed, Ordering::AcqRel);
+                }
+                shared.update_input_p2(poll.p2_held, poll.p2_pressed);
+                shared.pad_page_up.store(poll.p1_page_up, Ordering::Relaxed);
+                shared.pad_page_down.store(poll.p1_page_down, Ordering::Relaxed);
+                if poll.toggle_browser {
+                    shared.pad_toggle_browser.store(true, Ordering::Release);
+                }
+                if !poll.notifications.is_empty()
+                    && let Ok(mut st) = shared.pad_status.lock()
+                {
+                    *st = hub.status_summary();
+                }
+                for note in poll.notifications {
+                    shared.push_toast(note);
+                }
+                thread::sleep(std::time::Duration::from_millis(1));
+            }
+        })
+        .expect("failed to spawn the lockstep-pad thread")
+}
+
 /// Body of the emulation thread. Sets up audio (one SCHED_FIFO priority step above
 /// emulation) and thread scheduling, then loops until `shared.running` is cleared:
 /// drains [`EmulatorCommand`]s; picks the next frame start (in display-sync mode, the
@@ -692,7 +801,7 @@ fn worker_main(shared: Arc<RtSharedState>, cmd_rx: Receiver<EmulatorCommand>) {
     );
 
     let mut sys: Option<Box<System>> = None;
-    let mut saved: Option<Box<System>> = None;
+    let mut saved: [Option<Box<System>>; 9] = Default::default();
     let mut overclock = shared.overclock_enabled.load(Ordering::Acquire);
     let mut output_rate = audio.sample_rate;
     let mut next_deadline = MonotonicTimer::now_ns() + NTSC_FRAME_NS;
@@ -711,7 +820,7 @@ fn worker_main(shared: Arc<RtSharedState>, cmd_rx: Receiver<EmulatorCommand>) {
                     if let Some(prev) = &sys {
                         prev.save_sram();
                     }
-                    saved = None;
+                    saved = Default::default();
                     match System::new(*cart) {
                         Ok(s) => {
                             let mut s = Box::new(s);
@@ -736,7 +845,7 @@ fn worker_main(shared: Arc<RtSharedState>, cmd_rx: Receiver<EmulatorCommand>) {
                         prev.save_sram();
                     }
                     sys = None;
-                    saved = None;
+                    saved = Default::default();
                     shared.rom_loaded.store(false, Ordering::Release);
                     let blank = vec![0u8; FRAMEBUFFER_BYTES];
                     shared.framebuffer.publish_frame((&blank[..]).try_into().unwrap());
@@ -748,17 +857,47 @@ fn worker_main(shared: Arc<RtSharedState>, cmd_rx: Receiver<EmulatorCommand>) {
                         s.reset();
                     }
                 }
-                EmulatorCommand::SaveState => {
+                EmulatorCommand::SaveState(slot) => {
+                    let s_idx = (slot.clamp(1, 9) - 1) as usize;
                     if let Some(s) = &sys {
-                        saved = Some(s.clone());
+                        saved[s_idx] = Some(s.clone());
+                        match s.save_state_file(slot) {
+                            Ok(path) => {
+                                let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("state");
+                                shared.push_toast(format!("State saved to slot {} ({})", slot.clamp(1, 9), fname));
+                            }
+                            Err(_) => {
+                                shared.push_toast(format!("State saved to slot {} (memory)", slot.clamp(1, 9)));
+                            }
+                        }
                     }
                 }
-                EmulatorCommand::LoadState => {
-                    if let Some(snap) = &saved {
-                        let mut restored = snap.clone();
-                        restored.set_overclock(overclock);
-                        sys = Some(restored);
-                        audio.flush();
+                EmulatorCommand::LoadState(slot) => {
+                    let s_idx = (slot.clamp(1, 9) - 1) as usize;
+                    if let Some(s) = &mut sys {
+                        match s.load_state_file(slot) {
+                            Ok(path) => {
+                                s.set_overclock(overclock);
+                                s.joypad.live_p1 = Some(shared.buttons_held.clone());
+                                s.joypad.live_p2 = Some(shared.buttons_held_p2.clone());
+                                audio.flush();
+                                let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("state");
+                                shared.push_toast(format!("State loaded from slot {} ({})", slot.clamp(1, 9), fname));
+                            }
+                            Err(err) => {
+                                if let Some(snap) = &saved[s_idx] {
+                                    let mut restored = snap.clone();
+                                    restored.set_overclock(overclock);
+                                    restored.joypad.live_p1 = Some(shared.buttons_held.clone());
+                                    restored.joypad.live_p2 = Some(shared.buttons_held_p2.clone());
+                                    *s = restored;
+                                    audio.flush();
+                                    shared.push_toast(format!("State loaded from slot {} (memory)", slot.clamp(1, 9)));
+                                } else {
+                                    shared.push_toast(err);
+                                }
+                            }
+                        }
                     }
                 }
                 EmulatorCommand::SetOverclock(enabled) => {
@@ -813,6 +952,10 @@ fn worker_main(shared: Arc<RtSharedState>, cmd_rx: Receiver<EmulatorCommand>) {
         if let Some(s) = &mut sys {
             s.joypad.buttons_p1 = shared.buttons_latched.swap(0, Ordering::AcqRel);
             s.joypad.buttons_p2 = shared.buttons_latched_p2.swap(0, Ordering::AcqRel);
+            let zx = shared.zapper_x.load(Ordering::Acquire);
+            let zy = shared.zapper_y.load(Ordering::Acquire);
+            let ztrig = shared.zapper_trigger.swap(0, Ordering::AcqRel);
+            s.joypad.set_zapper(zx, zy, ztrig);
             s.apu.output_rate = output_rate;
             let ahead = shared.run_ahead.load(Ordering::Acquire);
             s.run_frame_ahead(ahead, &mut display_fb);

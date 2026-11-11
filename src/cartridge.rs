@@ -326,6 +326,12 @@ impl Cartridge {
         self.rom_path.as_ref().map(|p| p.with_extension("sav"))
     }
 
+    /// Path of a persistent save-state slot file: the ROM path with a `.s1`..`.s9` extension.
+    pub fn state_path(&self, slot: u8) -> Option<PathBuf> {
+        let s = slot.clamp(1, 9);
+        self.rom_path.as_ref().map(|p| p.with_extension(format!("s{}", s)))
+    }
+
     /// Loads `<rom>.sav` into PRG-RAM if the board has a battery and the file exists.
     pub fn load_battery_sram(&mut self) {
         if !self.has_battery {

@@ -127,6 +127,7 @@ static ADDR_MODE: [Mode; 256] = [
 /// the PPU advances three dots and the APU one cycle. See `docs/ARCHITECTURE.md`.
 ///
 /// `System` is `Clone`; a clone is a complete save state (ROM data is shared, not copied).
+#[repr(C)]
 #[derive(Clone)]
 pub struct System {
     /// Accumulator.
@@ -276,6 +277,28 @@ impl System {
         sys.mapper_clock = sys.mapper.wants_cpu_clock();
         sys.mapper_audio = sys.mapper.has_expansion_audio();
         sys.ppu.vram_hook = sys.mapper.wants_vram_addr();
+        let lower_title = sys.title.to_ascii_lowercase();
+        if [
+            "duck hunt",
+            "wild gunman",
+            "hogan",
+            "gumshoe",
+            "barker bill",
+            "freedom force",
+            "gotcha",
+            "mechanized attack",
+            "operation wolf",
+            "shooting range",
+            "to the earth",
+            "baby boomer",
+            "chiller",
+            "lone ranger",
+        ]
+        .iter()
+        .any(|kw| lower_title.contains(kw))
+        {
+            sys.joypad.zapper_connected = true;
+        }
         sys.power_on();
         Ok(sys)
     }
@@ -326,6 +349,100 @@ impl System {
         self.cart_for_sram.save_battery_sram(&self.mapper.battery_ram());
     }
 
+    /// Serializes the entire console state (CPU, 2 KB RAM, PPU, APU, mapper, and controller ports)
+    /// into a gzip-compressed byte buffer suitable for writing to a `.s1`..`.s9` save-state file.
+    pub fn to_state_bytes(&self) -> Vec<u8> {
+        use std::io::Write;
+        let mut raw = Vec::with_capacity(160 * 1024);
+        raw.extend_from_slice(b"LKST\x01\x00\x00\x00");
+        let pod_len = std::mem::offset_of!(Self, ppu);
+        raw.extend_from_slice(&(pod_len as u32).to_le_bytes());
+        // SAFETY: All fields of `System` before `ppu` are plain-old-data (`Copy`).
+        let cpu_pod = unsafe { std::slice::from_raw_parts(self as *const Self as *const u8, pod_len) };
+        raw.extend_from_slice(cpu_pod);
+        self.ppu.save_state(&mut raw);
+        self.apu.save_state(&mut raw);
+        self.mapper.save_mapper_state(&mut raw);
+        self.joypad.save_state(&mut raw);
+        raw.push(self.overclock_enabled as u8);
+
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let _ = enc.write_all(&raw);
+        enc.finish().unwrap_or(raw)
+    }
+
+    /// Restores the entire console state from a buffer produced by [`System::to_state_bytes`].
+    pub fn load_state_bytes(&mut self, data: &[u8]) -> Result<(), String> {
+        use std::io::Read;
+        let mut raw = Vec::new();
+        if data.starts_with(&[0x1F, 0x8B]) {
+            let mut dec = flate2::read::GzDecoder::new(data);
+            dec.read_to_end(&mut raw)
+                .map_err(|e| format!("Failed to decompress save state: {}", e))?;
+        } else {
+            raw.extend_from_slice(data);
+        }
+        let mut cur: &[u8] = &raw;
+        if cur.len() < 12 || &cur[0..8] != b"LKST\x01\x00\x00\x00" {
+            return Err("Invalid save state header".into());
+        }
+        let pod_len = std::mem::offset_of!(Self, ppu);
+        let saved_pod = u32::from_le_bytes(cur[8..12].try_into().unwrap()) as usize;
+        cur = &cur[12..];
+        if saved_pod != pod_len || cur.len() < pod_len {
+            return Err("CPU state size mismatch".into());
+        }
+        let (cpu_pod, rest) = cur.split_at(pod_len);
+        cur = rest;
+        // Clone self first so a partial failure leaves `self` untouched.
+        let mut tmp = self.clone();
+        // SAFETY: All fields of `System` before `ppu` are plain-old-data (`Copy`).
+        unsafe {
+            std::ptr::copy_nonoverlapping(cpu_pod.as_ptr(), &mut tmp as *mut Self as *mut u8, pod_len);
+        }
+        tmp.ppu.load_state(&mut cur)?;
+        tmp.apu.load_state(&mut cur)?;
+        tmp.mapper.load_mapper_state(&mut cur)?;
+        tmp.joypad.load_state(&mut cur)?;
+        if cur.is_empty() {
+            return Err("Truncated save state (tail)".into());
+        }
+        tmp.overclock_enabled = cur[0] != 0;
+        tmp.mapper_clock = tmp.mapper.wants_cpu_clock();
+        tmp.mapper_audio = tmp.mapper.has_expansion_audio();
+        tmp.ppu.vram_hook = tmp.mapper.wants_vram_addr();
+        *self = tmp;
+        Ok(())
+    }
+
+    /// Writes a compressed save state to `<rom>.s<slot>` (slots 1–9) on disk.
+    pub fn save_state_file(&self, slot: u8) -> Result<std::path::PathBuf, String> {
+        let path = self
+            .cart_for_sram
+            .state_path(slot)
+            .ok_or_else(|| "Cartridge has no ROM file path for disk save state".to_string())?;
+        let bytes = self.to_state_bytes();
+        std::fs::write(&path, bytes).map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+        Ok(path)
+    }
+
+    /// Loads a compressed save state from `<rom>.s<slot>` (slots 1–9) on disk.
+    pub fn load_state_file(&mut self, slot: u8) -> Result<std::path::PathBuf, String> {
+        let path = self
+            .cart_for_sram
+            .state_path(slot)
+            .ok_or_else(|| "Cartridge has no ROM file path for disk save state".to_string())?;
+        let bytes =
+            std::fs::read(&path).map_err(|e| format!("Slot {} empty ({})", slot.clamp(1, 9), e))?;
+        self.load_state_bytes(&bytes)?;
+        Ok(path)
+    }
+
+    /// Returns the disk path for save-state `slot` (1–9), if the cartridge was loaded from a file.
+    pub fn state_path(&self, slot: u8) -> Option<std::path::PathBuf> {
+        self.cart_for_sram.state_path(slot)
+    }
+
     /// Human-readable board name, e.g. `"MMC3 (4)"`.
     pub fn mapper_name(&self) -> &'static str {
         self.mapper.name()
@@ -355,6 +472,7 @@ impl System {
                 break;
             }
         }
+        self.joypad.step_zapper_frame();
     }
 
     /// Runs one real frame, then (if `ahead` > 0) speculatively runs `ahead` more frames
@@ -477,7 +595,18 @@ impl System {
                 return v;
             }
             0x4016 => (self.open_bus & 0xE0) | self.joypad.read_p1(),
-            0x4017 => (self.open_bus & 0xE0) | self.joypad.read_p2(),
+            0x4017 => {
+                let mut b = (self.open_bus & 0xE0) | self.joypad.read_p2();
+                if self.joypad.zapper_connected {
+                    if !self.ppu.zapper_sees_light(self.joypad.zapper_x, self.joypad.zapper_y) {
+                        b |= 0x08;
+                    }
+                    if self.joypad.zapper_trigger_frames > 0 {
+                        b |= 0x10;
+                    }
+                }
+                b
+            }
             0x4000..=0x401F => self.open_bus,
             _ => self.mapper.cpu_read(addr).unwrap_or(self.open_bus),
         };
@@ -1276,5 +1405,94 @@ impl System {
                 self.jammed = true;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a minimal NROM-128 iNES image whose reset handler at $8000 runs `code`.
+    fn make_test_rom(code: &[u8]) -> Vec<u8> {
+        let mut rom = vec![0u8; 16 + 0x4000];
+        rom[0..4].copy_from_slice(b"NES\x1A");
+        rom[4] = 1; // 16 KB PRG
+        rom[5] = 0; // CHR-RAM
+        rom[16..16 + code.len()].copy_from_slice(code);
+        // Reset vector ($FFFC-$FFFD in $C000 mirror) -> $8000
+        rom[16 + 0x3FFC] = 0x00;
+        rom[16 + 0x3FFD] = 0x80;
+        rom
+    }
+
+    #[test]
+    fn save_state_bytes_and_disk_slot_roundtrip_is_bit_exact() {
+        // Loop at $8000: INC $10; INX; BNE $8000; INC $11; JMP $8000
+        let code = [0xE6, 0x10, 0xE8, 0xD0, 0xFB, 0xE6, 0x11, 0x4C, 0x00, 0x80];
+        let rom_bytes = make_test_rom(&code);
+        let tmp_rom = std::env::temp_dir().join("lockstep_test_savestate.nes");
+        std::fs::write(&tmp_rom, &rom_bytes).unwrap();
+
+        let cart1 = Cartridge::from_file(&tmp_rom).unwrap();
+        let cart2 = Cartridge::from_file(&tmp_rom).unwrap();
+        let mut sys1 = System::new(cart1).unwrap();
+        let mut sys2 = System::new(cart2).unwrap();
+
+        for _ in 0..5 {
+            sys1.run_frame();
+        }
+        let state_path = sys1.save_state_file(3).unwrap();
+        assert!(state_path.exists());
+
+        sys2.load_state_file(3).unwrap();
+
+        for _ in 0..5 {
+            sys1.run_frame();
+            sys2.run_frame();
+        }
+
+        assert_eq!(sys1.pc, sys2.pc);
+        assert_eq!(sys1.a, sys2.a);
+        assert_eq!(sys1.x, sys2.x);
+        assert_eq!(sys1.y, sys2.y);
+        assert_eq!(sys1.cycle_count, sys2.cycle_count);
+        assert_eq!(sys1.ram, sys2.ram);
+        assert_eq!(&sys1.ppu.framebuffer[..], &sys2.ppu.framebuffer[..]);
+
+        let _ = std::fs::remove_file(&tmp_rom);
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    #[test]
+    fn zapper_light_sense_and_trigger_pulse_on_4017() {
+        // Simple loop at $8000: JMP $8000
+        let rom_bytes = make_test_rom(&[0x4C, 0x00, 0x80]);
+        let cart = Cartridge::from_ines_bytes(&rom_bytes, "Duck Hunt Test".into()).unwrap();
+        let mut sys = System::new(cart).unwrap();
+        // Title "Duck Hunt Test" auto-connects the Zapper.
+        assert!(sys.joypad.zapper_connected);
+
+        // Set backdrop palette $3F00 to bright white ($30) and run one frame so `pixels` is filled with $30.
+        sys.ppu.palette[0] = 0x30;
+        sys.joypad.set_zapper(128, 100, 2);
+
+        // Aimed off-screen: bit 3 (0x08 = dark) and bit 4 (0x10 = trigger) are both set.
+        sys.joypad.set_zapper(-1, -1, 2);
+        let v_off = sys.bus_read(0x4017);
+        assert_eq!(v_off & 0x18, 0x18);
+
+        // Run a frame so `pixels` are rendered with palette[0] = $30 (white), and trigger decrements from 2 -> 1.
+        sys.run_frame();
+        assert_eq!(sys.joypad.zapper_trigger_frames, 1);
+
+        // Position PPU beam at scanline 102, cycle 140 (just past (128, 100)).
+        sys.ppu.scanline = 102;
+        sys.ppu.cycle = 140;
+        sys.joypad.set_zapper(128, 100, 0);
+        assert!(sys.ppu.zapper_sees_light(128, 100));
+        let v_on = sys.bus_read(0x4017);
+        // Bit 3 (0x08) must be 0 when light is detected; bit 4 (0x10) is still 1 for 1 more frame.
+        assert_eq!(v_on & 0x08, 0x00);
+        assert_eq!(v_on & 0x10, 0x10);
     }
 }

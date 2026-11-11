@@ -1,6 +1,6 @@
 # Lockstep
 
-**A cycle-accurate NES emulator built for low latency and real-time Linux.**
+**A cycle-accurate NES emulator built for low latency — real-time on Linux, native on Windows.**
 
 Lockstep emulates the Nintendo Entertainment System at the level of individual CPU bus
 cycles and PPU dots. The CPU, PPU, APU and cartridge hardware all advance in lockstep
@@ -52,12 +52,15 @@ lockstep "Super Mario Bros. 3 (USA).zip"
   finishes only ~4 ms before it is shown. The margin adapts to your compositor.
 - **Run-ahead** (0/1/2 frames) hides a game's own built-in input lag. It is verified frame-exact by a test.
 - **Late input sampling**: controller state is read at the instant the game strobes the pad.
-- **Low-latency audio** via ALSA/PipeWire with a lock-free ring buffer and a PI-controlled
-  dynamic rate control loop whose buffer target adapts to your sound server
-  (10 ms on low-quantum setups, ~20–25 ms on default PipeWire); no drift, no clicks.
-- **SCHED_FIFO** emulation and audio threads, `mlockall(MCL_ONFAULT)`, CPU pinning
-  (honours `isolcpus=`), 1 ns timer slack, and a µs-precision spin-assisted deadline sleep.
-  PREEMPT_RT kernels are detected.
+- **Low-latency audio** via ALSA/PipeWire (Linux) or WASAPI (Windows) with a lock-free ring
+  buffer and a PI-controlled dynamic rate control loop whose buffer target adapts to your
+  sound server (10 ms on low-quantum setups, ~20–25 ms on default PipeWire/WASAPI); no drift,
+  no clicks.
+- **Real-time & high-priority scheduling**: on Linux, `SCHED_FIFO` emulation and audio threads,
+  `mlockall(MCL_ONFAULT)`, CPU pinning (honours `isolcpus=`), 1 ns timer slack, µs-precision
+  spin-assisted deadline sleep, and `PREEMPT_RT` detection. On Windows (which has no real-time
+  kernel scheduler), uses `QueryPerformanceCounter`, `timeBeginPeriod(1)`, `THREAD_PRIORITY_HIGHEST`
+  / `THREAD_PRIORITY_TIME_CRITICAL`, and a 1.5 ms spin-guard window.
 
 **Convenience**
 - **Plug-and-play USB / Bluetooth gamepads** (Player 1 & Player 2) via `gilrs` (`evdev`/`udev`
@@ -85,6 +88,10 @@ Linux system libraries:
 | Arch | `alsa-lib libx11 libxi mesa` (usually already present) |
 | Debian / Ubuntu | `libasound2-dev libx11-dev libxi-dev libgl1-mesa-dev pkg-config` |
 | Fedora | `alsa-lib-devel libX11-devel libXi-devel mesa-libGL-devel` |
+
+Windows requires no extra libraries beyond the standard Rust toolchain (`x86_64-pc-windows-msvc`
+or `x86_64-pc-windows-gnu`); audio (WASAPI), graphics, and gamepads (XInput / RawInput) link
+against standard Win32 system DLLs automatically.
 
 ```sh
 cargo build --release          # optimized binaries in target/release/
@@ -178,11 +185,12 @@ Everything is set through environment variables; there is no config file.
 | Variable | Default | Meaning |
 |---|---|---|
 | `LOCKSTEP_ROM_DIR` | *(auto)* | Directory the ROM browser opens in |
-| `LOCKSTEP_RT_PRIO` | `45` | SCHED_FIFO priority of the emulation thread (1–99). Audio runs one step higher. |
+| `LOCKSTEP_RT_PRIO` | `45` | SCHED_FIFO priority of the emulation thread (1–99, Linux only). Audio runs one step higher. |
+| `LOCKSTEP_PAD_SWAP` | *(unset)* | If set, swap South/East gamepad buttons (`East` = A, `South` = B) |
 | `LOCKSTEP_STATS` | *(unset)* | If set, print real-time statistics to stderr every 2 seconds |
-| `LOCKSTEP_PROFILE` | *(unset)* | `lockstep-headless shot` only: print a sampling profile |
+| `LOCKSTEP_PROFILE` | *(unset)* | `lockstep-headless shot` only (Linux): print a sampling profile |
 
-Real-time priorities require permission. See [docs/REALTIME.md](docs/REALTIME.md#permissions)
+Real-time priorities on Linux require permission. See [docs/REALTIME.md](docs/REALTIME.md#permissions)
 for the one-line `limits.conf` setup.
 
 ---
@@ -211,12 +219,18 @@ Test-ROM results (details and known gaps in [docs/ACCURACY.md](docs/ACCURACY.md)
 
 ## Real-time operation
 
-Short version:
-
+**Linux (true real-time)**
 1. Give your user real-time permission (`@audio - rtprio 95` in `/etc/security/limits.d/`).
 2. Run Lockstep. The browser header should say **Display-synced** and **SCHED_FIFO 45**.
 3. Optionally reserve a core with `isolcpus=N nohz_full=N threadirqs` on the kernel
    command line; Lockstep pins itself to it automatically.
+
+**Windows (best-effort low latency)**
+- Windows does not provide a deterministic real-time scheduler (`PREEMPT_RT` / `SCHED_FIFO`).
+- Instead, Lockstep uses `QueryPerformanceCounter` for sub-microsecond timestamps, requests
+  a 1 ms kernel timer tick (`timeBeginPeriod(1)`), promotes the emulation and audio threads to
+  `THREAD_PRIORITY_HIGHEST` / `THREAD_PRIORITY_TIME_CRITICAL`, and spin-waits the final 1.5 ms
+  before each frame deadline so display-synced JIT pacing and run-ahead still work cleanly.
 
 The full story covers the pacing modes, the just-in-time scheduler, run-ahead, the audio
 control loop, latency budgets, tuning and troubleshooting. It is in

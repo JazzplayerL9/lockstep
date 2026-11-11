@@ -972,10 +972,7 @@ fn worker_main(shared: Arc<RtSharedState>, cmd_rx: Receiver<EmulatorCommand>) {
         let rewinding = shared.rewind_active.load(Ordering::Acquire);
         let paused = shared.paused.load(Ordering::Acquire);
         let step_req = if paused {
-            shared
-                .step_frames
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| (v > 0).then(|| v - 1))
-                .is_ok()
+            shared.step_frames.swap(0, Ordering::AcqRel) > 0
         } else {
             shared.step_frames.store(0, Ordering::Release);
             false

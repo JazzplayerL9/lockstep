@@ -656,9 +656,7 @@ async fn run() {
             }
             if is_key_pressed(KeyCode::Period) && shared.rom_loaded.load(Ordering::Acquire) {
                 shared.paused.store(true, Ordering::Release);
-                let _ = shared
-                    .step_frames
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some(v.saturating_add(1)));
+                shared.step_frames.store(1, Ordering::Release);
             }
             let rew = is_key_down(KeyCode::Backspace)
                 || ((pad_held & BTN_SELECT != 0) && pad_page_up);

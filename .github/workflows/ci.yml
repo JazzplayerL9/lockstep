@@ -10,6 +10,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: write
+
 jobs:
   build-and-test:
     name: Build & Test (${{ matrix.os }})
@@ -64,6 +67,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          generate_release_notes: true
           files: |
             lockstep-linux-x86_64.tar.gz
             lockstep-windows-x86_64.zip
